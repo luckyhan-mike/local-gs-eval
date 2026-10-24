@@ -385,13 +385,15 @@ def main():
                             "paste_area_frac_fg"], paste_rows)
     write_csv("token_ringreg.csv", ["setup", "target", "local_variant", "paste_area_frac_fg", "ring_disp_px"],
               token_rows)
+    tok_json = work / "tokens" / "tokens.json"
+    token_report = load_json(tok_json) if tok_json.exists() else None
     write_summary(out_dir / "summary.md", rows, auc_rows, t_rows, gs_rows, reg_rows, sweep_rows, tuned, rcfg, ref,
-                  paste_rows, token_rows)
+                  paste_rows, token_rows, token_report)
     print(f"done -> {out_dir / 'summary.md'}")
 
 
 def write_summary(path, rows, auc_rows, t_rows, gs_rows, reg_rows, sweep_rows, tuned, rcfg, ref,
-                  paste_rows=(), token_rows=()):
+                  paste_rows=(), token_rows=(), token_report=None):
     agg = defaultdict(list)
     area = defaultdict(list)
     for s, k, meth, r, p, ss, l, apx, afr, cov in rows:
@@ -440,15 +442,45 @@ def write_summary(path, rows, auc_rows, t_rows, gs_rows, reg_rows, sweep_rows, t
                 cells = [f"{fmt(mean(s, r, m, 0))} / {fmt(mean(s, r, m, 2), 4)}"
                          for r in ("fg", "object", "oracle_fail", "rest")]
                 lines.append(f"| {s} | {m} | " + " | ".join(cells) + " |")
+        if token_report:
+            lines += ["", "### Token 变体对比（`_al` 对齐域、光心按 t 插值 = 可部署设置）", "",
+                      "输入 core = 输入相机上贴回核心区占前景比例（各输入相机平均）；oracle_fail 面积供对照（真值定义的光流失败区）。", "",
+                      "| 设置 | token 变体 | 输入 core | 贴回区占前景 | fg PSNR / LPIPS | object PSNR / LPIPS | rest PSNR |",
+                      "|---|---|---:|---:|---:|---:|---:|"]
+            for s in setups:
+                of = np.nanmean(area[(s, "oracle_fail")]) if area[(s, "oracle_fail")] else float("nan")
+                lines.append(f"| {s} | 纯光流 `{ref}`（oracle_fail 占前景 {fmt(of * 100, 1)}%） | — | — | "
+                             f"{fmt(mean(s, 'fg', ref, 0))} / {fmt(mean(s, 'fg', ref, 2), 4)} | "
+                             f"{fmt(mean(s, 'object', ref, 0))} / {fmt(mean(s, 'object', ref, 2), 4)} | "
+                             f"{fmt(mean(s, 'rest', ref, 0))} |")
+                for v, per_setup in token_report.get("fractions", {}).items():
+                    if s not in per_setup:
+                        continue
+                    core_in = np.mean([c["core"] for c in per_setup[s].values()])
+                    gv = next((g for (ss, g, _) in pr if ss == s and g.startswith(f"gs_tok{v}") and
+                               g.endswith("_al_local")), None)
+                    if gv is None:
+                        continue
+                    m = f"hyb_token[{gv}]"
+                    fr = np.mean([x[2] for x in pr[(s, gv, "flow")]]) if pr.get((s, gv, "flow")) else float("nan")
+                    lines.append(f"| {s} | {v} | {fmt(core_in * 100, 1)}% | {fmt(fr * 100, 1)}% | "
+                                 f"{fmt(mean(s, 'fg', m, 0))} / {fmt(mean(s, 'fg', m, 2), 4)} | "
+                                 f"{fmt(mean(s, 'object', m, 0))} / {fmt(mean(s, 'object', m, 2), 4)} | "
+                                 f"{fmt(mean(s, 'rest', m, 0))} |")
         lines += ["", "## 其余诊断（整窗口 GS、用真值配准的上限等）", ""]
     def pose_src(m):
-        return "calibK" if m.endswith("_calK") else "calib" if m.endswith("_cal") else "vggt"
+        core = m[:-len("_local")] if m.endswith("_local") else m
+        for suf, name in (("_calK", "calibK"), ("_cal", "calib"), ("_alv", "aligned_vggt"), ("_al", "aligned_int"),
+                          ("_int", "interp")):
+            if core.endswith(suf):
+                return name
+        return "vggt"
 
     for s in setups:
         gsv = sorted({m for (ss, r, m) in agg if ss == s and m.startswith("gs_") and "+reg" not in m})
         best_by_src = {}
-        for src in ("vggt", "calib", "calibK"):
-            cands = [m for m in gsv if pose_src(m) == src]
+        for src in ("vggt", "aligned_int", "aligned_vggt", "interp", "calib", "calibK"):
+            cands = [m for m in gsv if pose_src(m) == src and not m.endswith("_local")]
             if cands:
                 best_by_src[src] = max(cands, key=lambda m: mean(s, "object", m, 0))
         lines += [f"## 设置 {s}", "",

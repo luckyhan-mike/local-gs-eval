@@ -173,6 +173,24 @@ def render_aligned(runner, state, al, src, keep, kw):
     return out
 
 
+def load_token_sets(tok_root, ctx, tcfg):
+    """{variant: {"core": [raw masks], "recon": [raw masks]}} from detect_tokens.py output.
+
+    Supports the round-6 layout tokens/<setup>/<variant>/ and the older flat tokens/<setup>/."""
+    if not tok_root.exists():
+        return {}
+
+    def load(d):
+        return {kind: [read_mask(d / f"cam{k}_{kind}_raw.png") for k in ctx] for kind in ("core", "recon")}
+
+    names = [v for v in (tcfg.get("variants") or {}) if (tok_root / v).is_dir()]
+    if names:
+        return {v: load(tok_root / v) for v in names}
+    if (tok_root / f"cam{ctx[0]}_core_raw.png").exists():
+        return {"flat": load(tok_root)}
+    return {}
+
+
 def rig_positions(c2w_by_cam, ctx):
     """Camera positions projected on the context baseline: first context cam = 0, last = 1."""
     c = {k: v[:3, 3] for k, v in c2w_by_cam.items()}
@@ -215,20 +233,30 @@ def main():
         raw_shape = raws[ctx[0]].shape[:2]
         aligned_shape = imread_rgb(cam_path(cfg, "aligned", ctx[0])).shape[:2]
         fg_ctx = [read_mask(work / "prepare" / f"fg_raw_{k:02d}.png") for k in ctx]
-        tok_dir = work / "tokens" / setup
-        tokens = None
-        if tok_dir.exists():
-            tokens = {kind: [read_mask(tok_dir / f"cam{k}_{kind}_raw.png") for k in ctx] for kind in ("core", "recon")}
+        token_sets = load_token_sets(work / "tokens" / setup, ctx, tcfg)
         # Shared t with the flow branch: reuse the existing pose file (e.g. copied from round 2) if present.
         pose_file = work / "poses" / f"{setup}.json"
         shared_t = {int(k): v for k, v in load_json(pose_file)["t_pose"].items()} if pose_file.exists() else None
+        # A token crop is encoded once per token variant (its window is that variant's recon bbox);
+        # other crops use the primary variant's masks for their local Gaussians.
+        jobs = []
         for crop in crops:
+            if crop == "token" and token_sets:
+                for v, ts in token_sets.items():
+                    if any(m.any() for m in ts["recon"]):
+                        jobs.append((crop, f"tok{v}", v, ts))
+                    else:
+                        print(f"[{setup}] token 变体 {v} 在所有输入相机上都没有标记：不触发 GS，等价于纯光流")
+            else:
+                prim = token_sets.get(tcfg.get("primary")) if token_sets else None
+                jobs.append((crop, crop, tcfg.get("primary") if prim else None, prim))
+        for crop, label, tok_variant, tokens in jobs:
             win = crop_window(crop, raw_shape, [raws[k] for k in ctx], fg_ctx, gcfg, cfg["chroma"],
                               tokens["recon"] if tokens else None, tcfg.get("crop_pad_px", 0))
             x0, y0, side = win
             for size in sizes:
                 assert size % 14 == 0, "AnySplat/VGGT 需要 14 的倍数"
-                base = f"gs_{crop}{size}"
+                base = f"gs_{label}{size}"
                 crops_img = {k: cv2.resize(raws[k][y0:y0 + side, x0:x0 + side], (size, size),
                                            interpolation=cv2.INTER_AREA) for k in raws}
                 print(f"[{setup}] {base}: window x0={x0} y0={y0} side={side} (x{side / size:.2f} upsampling)")
@@ -335,7 +363,8 @@ def main():
                                 write_mask(out / f"cam{k}_valid.png", valid)
                                 if cores is not None:
                                     imwrite(out / f"cam{k}_alpha_core.png", np.clip(cores[i][1], 0, 1))
-                            meta = dict(diag, window=list(win), size=size, crop=crop, render=rv, render_res=res,
+                            meta = dict(diag, window=list(win), size=size, crop=crop, token_variant=tok_variant,
+                                        render=rv, render_res=res,
                                         eps2d_used=float(eps2d), time_render_per_view_s=t_render, pose_source=src,
                                         pose_diag=pdiag, local=kp is not None)
                             save_json(out / "meta.json", meta)

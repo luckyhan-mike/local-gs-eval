@@ -36,7 +36,11 @@ def main():
     for setup in cfg["setups"]:
         _, targets = setup_cams(cfg, setup)
         suffix = {"vggt": "", "interp": "_int", "aligned_int": "_al", "aligned_vggt": "_alv", "calib": "_cal", "calibK": "_calK"}
-        variants = [f"gs_{crop}{size}_{rv['name']}{suffix[src]}" for crop in gcfg["crops"] for size in gcfg["sizes"]
+        tok_root = work / "tokens" / setup
+        tok_vars = [v for v in (cfg.get("tokens", {}).get("variants") or {}) if (tok_root / v).is_dir()]
+        labels = [f"tok{v}" for v in tok_vars] if tok_vars else ["token"]
+        crop_labels = [lab for crop in gcfg["crops"] for lab in (labels if crop == "token" else [crop])]
+        variants = [f"gs_{lab}{size}_{rv['name']}{suffix[src]}" for lab in crop_labels for size in gcfg["sizes"]
                     for rv in gcfg["renders"] for src in gcfg.get("pose_sources", ["vggt"])]
         if (work / "tokens" / setup).exists():
             variants += [v + "_local" for v in variants]

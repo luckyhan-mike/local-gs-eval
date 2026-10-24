@@ -14,7 +14,25 @@
 
 ---
 
-## 0. 第五轮：在对齐（离轴）域渲染 GS，贴回足迹改为可见表面（当前主实验）
+## 0. 第六轮：收紧 token 检测（当前主实验）
+
+第五轮结论：对齐域渲染解决了几何错位（cam3 环带位移 0 px），token 贴回第一次超过纯光流（cam3 fg 25.27 vs 22.60 dB，魔方区 16.99 vs 14.53 dB）。但贴回区仍覆盖约 49% 前景，而光流真正失败的区域只有约 12%；其余部分把正确的光流换成更软的 GS，导致 fg LPIPS 和 rest 变差。用同一批 `_al` 高斯只贴 oracle 失败区时 fg 达到 27.03 dB / 0.057（PSNR 与 LPIPS 均优于光流），说明**瓶颈是检测精度**。小基线（cam5）即使完美检测也不如光流，应基本不触发。
+
+第六轮一次跑多个 token 检测变体（`tokens.variants`），每个变体各自编码一次 AnySplat，便于直接比较：
+
+| 变体 | 遮挡/匹配失败 | 深度突变 | 去小连通域 | 本地实测输入 core（占前景，各输入相机） |
+|---|---|---|---|---|
+| `r5`（第五轮，对照） | DIS 遮挡 + RIFE（\|W₀−W₁\|>0.08 或共线残差>2） | 任意 | 否 | cam3 26–38%；cam5 7–22% |
+| `rife` | 仅 RIFE（>0.20 或 >6，阈值来自第二轮风险扫描最优 IoU） | 只保留紧挨失败处的 | ≥150 px | cam3 3–16%；cam5 0–9% |
+| `strict` | 仅 \|W₀−W₁\|>0.25 | 不用 | ≥300 px | cam3 0–13%；cam5 0–7% |
+
+`rife` 的标记集中在魔方、手和魔方扫过的头发上，脸和衣服基本不再被标（`tokens/<setup>/<variant>/cam{k}_overlay.png`）。基线越小标记越少，小基线下可能完全不触发（此时等价于纯光流）。
+
+位姿只保留可部署的 `aligned_int`（光心按 t 插值）和对照 `aligned_vggt`；裁剪只保留 `token`。GS 变体命名：`gs_tok<变体>448_nat_dil_al_local`。`summary.md` 新增"Token 变体对比"表：输入 core、贴回区面积、fg / object / rest，并列出 oracle_fail 面积作对照。
+
+另外合入第五轮 Linux 上的两处修复（RGB+深度渲染背景通道、aligned 位姿诊断回退），并修正 summary 中按位姿来源分类把 `_al`/`_alv` 归为 vggt 的问题。
+
+## 0.1 第五轮：在对齐（离轴）域渲染 GS，贴回足迹改为可见表面
 
 第四轮 token 贴回能把魔方补对，但整体变差，原因有两个，第五轮分别修正：
 
@@ -29,7 +47,7 @@
 
 2. **贴回足迹 = 输入相机里可见的表面。** 第四轮保留了视线穿过 token 的所有高斯，魔方后面的头发、绿幕上的大高斯也进来了，投影到虚拟视点后足迹约占前景的 61%，还有 40% 在前景外，把可靠的光流也换掉了（rest 从 33.5 dB 掉到 21.9 dB）。第五轮改为：渲染每台输入相机的期望深度，只保留投影落在 token 区域内、且深度通过测试（≤ 渲染深度×1.03）的高斯（`gs.keep_mode: visible`）。遮挡区要补的背景正是另一台输入相机 token 区域里的可见表面，所以不会丢。贴回区还会限制在光流结果前景（抠像）外扩 15 px 内（不用真值）。
 
-## 0.1 第四轮：按原始框架做 token 局部 GS
+## 0.2 第四轮：按原始框架做 token 局部 GS
 
 前三轮的不可靠区域都定义在**虚拟视点（目标图）**上，GS 也是对整个裁剪窗口重建，这和原始框架不一致。第四轮改为：
 
@@ -61,7 +79,7 @@ run_anysplat.py：窗口 = 各输入相机重建区外接框；AnySplat 编码�
 
 **第三轮更正**：用对齐图上真实匹配点的视差比例独立测得目标相机的 t，VGGT 与实测平均只差 0.011，棋盘格标定差 0.058。因此第三轮"cam3–cam4 间距只有一半"和"RIFE 的 t 对空间位置非线性"两条结论**撤回**：单块正对棋盘格下旋转与平移退化，标定的相机位置不可靠；RIFE 的 t 基本线性（oracle 与实测差 0.018），VGGT 的 t 是可靠的。标定脚本保留但默认不再使用。
 
-## 0.2 第三轮改动（相对第二轮实测）
+## 0.3 第三轮改动（相对第二轮实测）
 
 第二轮结论：cam3 物体区里，配准后的 GS 比最强光流（pose t + scale 0.5）高约 2.7 dB，LPIPS 也更低；但未配准时两者打平。GS 渲染与真值平均错位 8–10 px，说明 VGGT 估计的目标相机位姿和内参是主要瓶颈；滤波核影响不到 0.1 dB。第三轮针对这一点：
 
@@ -85,7 +103,7 @@ run_anysplat.py：窗口 = 各输入相机重建区外接框；AnySplat 编码�
 
 5. **评估**：参考光流改为 `flow_s1.0_pose`（第二轮在两种基线下都优于均匀 t）；`+reg` 的 GS 也构造 `hyb_risk` / `hyb_risktuned` 混合，可以单独量化检测器的损失；配准 `ok` 只在确实接受了非恒等变换时计为成功（第二轮恒等回退也计入了）；关键对比表按位姿来源分别列出最好的 GS。
 
-## 0.3 第二轮改动（相对 2026-10-24 第一轮实测）
+## 0.4 第二轮改动（相对 2026-10-24 第一轮实测）
 
 第一轮结论：GS 在光流失败区只比光流高 0.15 dB，且 SSIM/LPIPS 更差；但拼图显示 GS 把魔方补对了，误差主要是**全图几个像素的错位**和 **448 渲染再放大 2.4 倍的模糊**（`rest` 区 GS 19.6 dB vs 光流 33.2 dB）。第二轮针对这两点：
 
@@ -157,6 +175,20 @@ cd local-gs-eval && git pull
 HF_HUB_OFFLINE=1 PYTHONUNBUFFERED=1 bash run_all.sh configs/mofang_9cam.yaml
 python -m unittest discover -s tests -v
 ```
+
+**第六轮（复用第五轮的工作目录）**：`prepare`、光流、`poses/` 不变；token 需要重新检测（新的变体目录结构）：
+
+```bash
+export LGS_WORK_DIR=work/round6
+mkdir -p $LGS_WORK_DIR && cp -r work/round5/{prepare,flow,poses,compat_packages} $LGS_WORK_DIR/
+python scripts/detect_tokens.py --config configs/mofang_9cam.yaml
+python scripts/run_anysplat.py  --config configs/mofang_9cam.yaml
+python scripts/evaluate.py      --config configs/mofang_9cam.yaml
+python scripts/validate_results.py configs/mofang_9cam.yaml
+python -m unittest discover -s tests -v
+```
+
+先看 `summary.md` 的"Token 变体对比"表：目标是 cam3 的 `rife`/`strict` 在 fg 的 PSNR 和 LPIPS 都优于纯光流（接近 oracle 上限 27.0 dB / 0.057），且 rest 回到约 33.5 dB；cam5 贴回区很小、指标接近纯光流。
 
 **第五轮（复用第四轮的工作目录）**：`prepare`、光流、`poses/`、`tokens/` 都不变，只需重跑 GS 和评估：
 

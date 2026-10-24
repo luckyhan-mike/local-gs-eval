@@ -36,6 +36,11 @@ tokens:                                 # 输入相机上的不可靠区域检�
   crop_pad_px: 32                       # token 裁剪窗口在重建区外接框外的边距
   paste_feather_px: 8                   # 贴回羽化宽度（落在重建边距内，双方都可靠的区域）
   ring_px: 24                           # 环带配准：在贴回区外这一圈用光流结果做参考（不用真值）
+  primary: rife                         # center 等非 token 裁剪的局部高斯用哪个变体
+  variants:                             # 每个变体单独输出 tokens/<setup>/<name>/，run_anysplat 对每个变体各编码一次
+    r5:     {use_dis: true,  rife_warp: 0.08, rife_col: 2.0,   depth: any,       min_cc_px: 0}   # 第五轮设置（对照）
+    rife:   {use_dis: false, rife_warp: 0.20, rife_col: 6.0,   depth: near_fail, min_cc_px: 150} # 只用 RIFE 失败信号，深度跳变须挨着失败处
+    strict: {use_dis: false, rife_warp: 0.25, rife_col: 1.0e+9, depth: "off",    min_cc_px: 300} # 只用 |W0-W1|，最保守
   ring_max_disp_px: 20                  # 环带配准位移超过该值视为不可信，退回直接贴回
   paste_fg_dilate_px: 15                # 贴回只在光流结果前景（绿幕抠像）附近进行，不用真值
 
@@ -51,13 +56,13 @@ calib:                                  # 离线阵列标定（第三轮负面�
 
 gs:
   sizes: [448]                          # AnySplat 训练分辨率；上一轮 518 的输入视点自渲染明显退化
-  crops: [token, center]                # token: 输入相机 token 重建区外接框（第四轮主设置）；center: 中心 1080x1080（整窗口对照）；roi/fg 保留可选
+  crops: [token]                        # token: 输入相机 token 重建区外接框（第四轮主设置）；center: 中心 1080x1080（整窗口对照）；roi/fg 保留可选
   roi_pad_px: 80                        # ROI 在魔方外接框四周的边距（覆盖手和遮挡带）
   roi_min_side: 448                     # ROI 最小边长（不小于输入分辨率，避免下采样以外的放大）
   roi_window: null                      # 手动指定 [x0, y0, side] 可跳过自动检测
   filter3d_var: 0.2                     # Mip-Splatting 3D 平滑滤波方差系数 s（σ² = s·(d/f)²）
   filter3d_comp: false                  # 3D 滤波的不透明度能量补偿；AnySplat 的扁平高斯会被压成透明（第二轮），默认关闭
-  pose_sources: [vggt, aligned_int, aligned_vggt]   # vggt: 目标相机原图域渲染再经 H_k（对照）；aligned_*: 直接在对齐（离轴）域渲染，int=光心按光流同一 t 插值，vggt=光心取 VGGT 估计。interp（第四轮，朝向插值）失败已弃用
+  pose_sources: [aligned_int, aligned_vggt]         # vggt: 目标相机原图域渲染再经 H_k（对照）；aligned_*: 直接在对齐（离轴）域渲染，int=光心按光流同一 t 插值，vggt=光心取 VGGT 估计。interp（第四轮，朝向插值）失败已弃用
   aligned_ref: 4                        # 对齐参考相机（单应 H 近似相似变换的那台，即中心相机）
   aligned_pad_px: 160                   # 对齐域渲染画布四周的余量（平面单应会平移画面）
   keep_mode: visible                    # 局部高斯：visible=输入相机中深度测试后的可见表面；ray=视线穿过即保留（第四轮，足迹过大）
