@@ -16,8 +16,9 @@ import cv2
 import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from lgs.anysplat_wrap import AnySplatRunner, paste_and_warp  # noqa: E402
-from lgs.common import (bbox, cam_path, cube_mask, imread_rgb, imwrite, load_cfg, read_mask,  # noqa: E402
+from lgs.anysplat_wrap import (AnySplatRunner, apply_sim3, distort_maps, paste_and_warp,  # noqa: E402
+                               rot_angle_deg, sim3_from_cams)
+from lgs.common import (bbox, cam_path, cube_mask, imread_rgb, imwrite, load_cfg, load_json, read_mask,  # noqa: E402
                         save_json, setup_cams, neighbors, write_mask)
 from lgs.compat import anysplat_source  # noqa: E402
 
@@ -46,6 +47,52 @@ def crop_window(mode, raw_shape, ctx_raws, fg_masks, gcfg, ck):
             raise RuntimeError("未在所有输入相机中检测到魔方，请在配置 gs.roi_window 中手动指定 [x0, y0, side]")
         return square_around(bbox(np.logical_or.reduce(masks)), raw_shape, gcfg["roi_pad_px"], gcfg["roi_min_side"])
     raise ValueError(mode)
+
+
+POSE_SUFFIX = {"vggt": "", "calib": "_cal", "calibK": "_calK"}
+
+
+def load_rig(work):
+    p = work / "calib" / "rig.json"
+    if not p.exists():
+        return None
+    cams = load_json(p)["cameras"]
+    return {int(k): {"c2w": np.array(v["c2w"]), "K": np.array(v["K"]), "dist": np.array(v["dist"])}
+            for k, v in cams.items()}
+
+
+def target_poses(state, ctx, targets, win, rig, sources):
+    """Target camera poses/intrinsics in the Gaussian frame for each requested pose source.
+
+    vggt:   joint VGGT camera head (round 1-2).
+    calib:  offline rig calibration, mapped into the Gaussian frame by a Sim(3) fitted on the
+            context cameras; intrinsics still from VGGT (consistent with how the Gaussians were built).
+    calibK: as calib, plus calibrated focal/principal point and lens distortion.
+    Returns {source: (c2w, intr_norm, use_distortion, diagnostics)}.
+    """
+    out = {"vggt": (state["tgt_c2w"], state["tgt_intr"], False, None)}
+    if not ({"calib", "calibK"} & set(sources)):
+        return {k: v for k, v in out.items() if k in sources}
+    if rig is None:
+        raise RuntimeError("pose_sources 含 calib/calibK，但缺少 work/calib/rig.json，请先运行 scripts/calibrate_rig.py")
+    cal_ctx = np.stack([rig[k]["c2w"] for k in ctx])
+    s, r, t = sim3_from_cams(cal_ctx, state["ctx_c2w"])
+    al_ctx = apply_sim3(cal_ctx, s, r, t)
+    base = np.linalg.norm(state["ctx_c2w"][-1, :3, 3] - state["ctx_c2w"][0, :3, 3]) + 1e-12
+    pdiag = {"sim3_scale": float(s),
+             "ctx_rot_err_deg": [rot_angle_deg(al_ctx[i, :3, :3], state["ctx_c2w"][i, :3, :3]) for i in range(len(ctx))],
+             "ctx_center_err_rel_baseline": [float(np.linalg.norm(al_ctx[i, :3, 3] - state["ctx_c2w"][i, :3, 3]) / base)
+                                             for i in range(len(ctx))]}
+    tgt = apply_sim3(np.stack([rig[k]["c2w"] for k in targets]), s, r, t)
+    out["calib"] = (tgt, state["tgt_intr"], False, pdiag)
+    x0, y0, side = win
+    intr = []
+    for k in targets:
+        K = rig[k]["K"]
+        intr.append(np.array([[K[0, 0] / side, 0, (K[0, 2] - x0) / side],
+                              [0, K[1, 1] / side, (K[1, 2] - y0) / side], [0, 0, 1]]))
+    out["calibK"] = (tgt, np.stack(intr), True, pdiag)
+    return {k: v for k, v in out.items() if k in sources}
 
 
 def rig_positions(c2w_by_cam, ctx):
@@ -79,6 +126,8 @@ def main():
     if compat_packages.exists():
         sys.path.insert(0, str(compat_packages))
     runner = AnySplatRunner(anysplat_source(cfg["anysplat_dir"], work), cfg["anysplat_ckpt"])
+    rig = load_rig(work)
+    dmaps = {}
 
     for setup in args.setups or list(cfg["setups"]):
         ctx, targets = setup_cams(cfg, setup)
@@ -101,28 +150,37 @@ def main():
                       f"ctx self-PSNR={np.mean(diag['ctx_self_psnr']):.2f}dB  "
                       f"pose align rot err={max(diag['ctx_rot_err_deg']):.2f}deg")
 
-                for rv in gcfg["renders"]:
-                    res = size if rv["res"] == "input" else side
-                    eps2d = rv["eps2d"]
-                    if eps2d == "auto":  # keep the 0.3 px dilation of the input grid when rendering denser
-                        eps2d = 0.3 * (res / size) ** 2
-                    variant = f"{base}_{rv['name']}"
-                    out = work / "gs" / setup / variant
-                    t0 = time.time()
-                    rgb, alpha = runner.render(state, state["tgt_c2w"], state["tgt_intr"], res,
-                                               mode=rv["mode"], eps2d=eps2d, filter3d=rv["filter3d"],
-                                               filter3d_var=gcfg["filter3d_var"])
-                    t_render = (time.time() - t0) / len(targets)
-                    for i, k in enumerate(targets):
-                        img, a, valid = paste_and_warp(rgb[i], alpha[i], win, raw_shape, hs[k], aligned_shape)
-                        imwrite(out / f"cam{k}.png", img)
-                        imwrite(out / f"cam{k}_alpha.png", np.clip(a, 0, 1))
-                        write_mask(out / f"cam{k}_valid.png", valid)
-                    meta = dict(diag, window=list(win), size=size, crop=crop, render=rv, render_res=res,
-                                eps2d_used=float(eps2d), time_render_per_view_s=t_render)
-                    save_json(out / "meta.json", meta)
-                    print(f"  {variant}: res={res} mode={rv['mode']} eps2d={eps2d:.3f} "
-                          f"filter3d={rv['filter3d']} render/view={t_render * 1000:.1f}ms")
+                poses_by_src = target_poses(state, ctx, targets, win, rig, gcfg["pose_sources"])
+                for src, (tgt_c2w, tgt_intr, use_dist, pdiag) in poses_by_src.items():
+                    if pdiag:
+                        print(f"  pose source {src}: ctx rot err after Sim3={max(pdiag['ctx_rot_err_deg']):.2f}deg "
+                              f"center err/baseline={max(pdiag['ctx_center_err_rel_baseline']):.3f}")
+                    for rv in gcfg["renders"]:
+                        res = size if rv["res"] == "input" else side
+                        eps2d = rv["eps2d"]
+                        if eps2d == "auto":  # keep the 0.3 px dilation of the input grid when rendering denser
+                            eps2d = 0.3 * (res / size) ** 2
+                        variant = f"{base}_{rv['name']}{POSE_SUFFIX[src]}"
+                        out = work / "gs" / setup / variant
+                        t0 = time.time()
+                        rgb, alpha = runner.render(state, tgt_c2w, tgt_intr, res, mode=rv["mode"], eps2d=eps2d,
+                                                   filter3d=rv["filter3d"], filter3d_var=gcfg["filter3d_var"],
+                                                   filter3d_comp=gcfg.get("filter3d_comp", False))
+                        t_render = (time.time() - t0) / len(targets)
+                        for i, k in enumerate(targets):
+                            dmap = dmaps.setdefault(k, distort_maps(rig[k]["K"], rig[k]["dist"], raw_shape)) \
+                                if use_dist else None
+                            img, a, valid = paste_and_warp(rgb[i], alpha[i], win, raw_shape, hs[k],
+                                                           aligned_shape, dmap)
+                            imwrite(out / f"cam{k}.png", img)
+                            imwrite(out / f"cam{k}_alpha.png", np.clip(a, 0, 1))
+                            write_mask(out / f"cam{k}_valid.png", valid)
+                        meta = dict(diag, window=list(win), size=size, crop=crop, render=rv, render_res=res,
+                                    eps2d_used=float(eps2d), time_render_per_view_s=t_render, pose_source=src,
+                                    pose_diag=pdiag)
+                        save_json(out / "meta.json", meta)
+                        print(f"  {variant}: res={res} mode={rv['mode']} eps2d={eps2d:.3f} "
+                              f"filter3d={rv['filter3d']} render/view={t_render * 1000:.1f}ms")
 
                 order = ctx + targets
                 c2w = {k: state["all_c2w_joint"][i] for i, k in enumerate(order)}

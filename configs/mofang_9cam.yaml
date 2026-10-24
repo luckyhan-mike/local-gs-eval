@@ -23,6 +23,16 @@ chroma:                                 # 绿幕抠像（OpenCV HSV，H∈[0,180
   v_min: 30
   min_area_frac: 0.002
 
+calib:                                  # 离线阵列标定（scripts/calibrate_rig.py）
+  board_pattern: "北极星/biao_ding_9/grid_{:02d}.png"      # 同一阵列拍摄的棋盘格原图
+  board_inner: [11, 8]                  # 内角点数（12x9 格）
+  square_size: 1.0                      # 世界单位 = 1 格
+  pair_max_gap: 4                       # 场景匹配只在序号差 <= 4 的相机对之间做
+  max_matches_per_pair: 600
+  triangulate_max_err_px: 4.0
+  per_cam_focal: false                  # 9 台同型号相机共享焦距；单独估计时焦距与深度耦合、散布 3%（不稳定）
+  huber_px: 1.5
+
 gs:
   sizes: [448]                          # AnySplat 训练分辨率；上一轮 518 的输入视点自渲染明显退化
   crops: [center, roi]                  # center: 中心 1080x1080；roi: 输入相机中魔方外接框+边距；fg: 人物外接框
@@ -30,12 +40,12 @@ gs:
   roi_min_side: 448                     # ROI 最小边长（不小于输入分辨率，避免下采样以外的放大）
   roi_window: null                      # 手动指定 [x0, y0, side] 可跳过自动检测
   filter3d_var: 0.2                     # Mip-Splatting 3D 平滑滤波方差系数 s（σ² = s·(d/f)²）
+  filter3d_comp: false                  # 3D 滤波的不透明度能量补偿；AnySplat 的扁平高斯会被压成透明（第二轮），默认关闭
+  pose_sources: [vggt, calib, calibK]   # 目标相机位姿：VGGT 联合估计 / 标定位姿+VGGT 内参 / 标定位姿+标定内参与畸变
   renders:                              # 每个 (crop, size) 只编码一次，下列渲染方式复用同一组高斯
-    - {name: in,        res: input,  mode: classic,     eps2d: 0.3,  filter3d: false}  # 上一轮做法：448 渲染后放大
-    - {name: nat,       res: native, mode: classic,     eps2d: 0.3,  filter3d: false}  # 直接按窗口原生分辨率渲染
+    # 第二轮 in / nat / nat_dil / nat_mip2d 相差 <0.1 dB，本轮只保留 nat_dil 与修正后的 nat_mip
     - {name: nat_dil,   res: native, mode: classic,     eps2d: auto, filter3d: false}  # 膨胀按分辨率比例放大：0.3·(res/size)²
-    - {name: nat_mip2d, res: native, mode: antialiased, eps2d: 0.1,  filter3d: false}  # Mip-Splatting 2D Mip 滤波
-    - {name: nat_mip,   res: native, mode: antialiased, eps2d: 0.1,  filter3d: true}   # Mip-Splatting 3D 平滑 + 2D Mip
+    - {name: nat_mip,   res: native, mode: antialiased, eps2d: 0.1,  filter3d: true}   # Mip-Splatting 3D 平滑(无补偿) + 2D Mip
 
 risk:                                   # 光流自身信号 → 风险区域（不使用真值）
   warp_thresh: 0.08                     # |W0-W1| 通道均值阈值（0~1）
@@ -44,7 +54,7 @@ risk:                                   # 光流自身信号 → 风险区域（
   fg_dilate_px: 15
 
 eval:
-  ref_flow: flow_s1.0_uniform           # 用于定义风险区域与混合的参考光流结果
+  ref_flow: flow_s1.0_pose              # 用于定义风险区域与混合的参考光流（第二轮起：pose t 在两种基线下都更好）
   fail_err_thresh: 0.08                 # 光流误差 > 该值视为“光流失败”（oracle 区域与 AUC 标签）
   edge_thresh: 0.3                      # 视差水平梯度阈值（像素/像素）
   edge_dilate_px: 5

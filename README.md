@@ -14,7 +14,31 @@
 
 ---
 
-## 0. 第二轮改动（相对 2026-10-24 第一轮实测）
+## 0. 第三轮改动（相对第二轮实测）
+
+第二轮结论：cam3 物体区里，配准后的 GS 比最强光流（pose t + scale 0.5）高约 2.7 dB，LPIPS 也更低；但未配准时两者打平。GS 渲染与真值平均错位 8–10 px，说明 VGGT 估计的目标相机位姿和内参是主要瓶颈；滤波核影响不到 0.1 dB。第三轮针对这一点：
+
+1. **离线阵列标定 `scripts/calibrate_rig.py`**。阵列在拍棋盘格和拍魔方之间没有动过，所以两次拍摄共享同一组相机参数，可以用一次光束平差（BA）把两类约束一起解出来：
+   - 棋盘格（`北极星/biao_ding_9`，12×9 格 = 11×8 内角点）：9 台相机同时看到同一块平面板，88 个角点的亚像素位置作为已知 3D 点，同时固定世界坐标系（板平面，单位 = 1 格）；
+   - 魔方场景：相邻相机对（序号差 ≤ 4）的 SIFT 匹配，经基础矩阵 RANSAC 过滤后三角化，作为未知 3D 点。
+
+   未知量：每台相机的 R、t，共享焦距（9 台同型号；单独估计时焦距与深度耦合，散布 3%），共享径向畸变 k1、k2，主点固定在图像中心。第一阶段只用棋盘格做 `cv2.calibrateCamera`（共享内参）作初值，第二阶段 BA（先线性损失，再 Huber）。
+
+   **本地（Windows CPU）实测**：棋盘 RMS 0.21 px（第一阶段）/ 0.37 px（BA），场景匹配重投影中位数 0.15 px、90% 分位 0.43 px，焦距 ≈1822–1836 px。相机间距明显不均匀，相邻光心间距（单位：格）为 2.19、2.18、1.89、**0.90**、1.82、2.34、1.69、2.56（cam3–cam4 只有其他间距的一半）。这一点也有旋转上的独立印证：cam3→4 的会聚角步长只有 2.3°，是所有相邻对里最小的。
+
+2. **GS 用标定位姿渲染**（`gs.pose_sources: [vggt, calib, calibK]`，变体后缀 `''`、`_cal`、`_calK`）。标定位姿通过输入相机拟合的 Sim(3) 映射到 AnySplat 的高斯坐标系，**目标图像不参与**，因此是可部署的做法：
+   - `_cal`：标定位姿 + VGGT 内参（与高斯本身的几何一致）；
+   - `_calK`：标定位姿 + 标定内参 + 镜头畸变（先按针孔渲染，再按畸变模型重映射到原图）。
+
+   `+reg` 的配准残差就是检验标准：如果 `_cal` 的残差从 8–10 px 降到 1–2 px、物体区接近第二轮的 `+reg` 上限，这条路线就在可部署条件下成立。
+
+3. **光流的 t 加入 `posecal`**：t 取标定光心在两侧输入相机连线上的投影比例。本地已算出：标定的 t 与 oracle t 并不重合（例如 cam3 目标 3：标定 0.875、VGGT 0.80、oracle 0.76），说明 RIFE 的时间步对真实空间位置的响应本身是非线性的——这正是"时序插帧 ≠ 空间插帧"的直接证据。本轮用实验量化它。
+
+4. **修正 3D Mip 滤波**：第二轮 `_nat_mip` 崩溃的原因是 Mip-Splatting 的不透明度能量补偿 `sqrt(det Σ / det(Σ+σ²I))` 要求高斯在训练时就带着这个滤波；AnySplat 的扁平面片高斯 det Σ ≈ 0，事后补偿会把它们压成透明。现在默认关闭补偿（`gs.filter3d_comp: false`）。第二轮 `in / nat / nat_dil / nat_mip2d` 相差 <0.1 dB，本轮只保留 `nat_dil` 和修正后的 `nat_mip`。
+
+5. **评估**：参考光流改为 `flow_s1.0_pose`（第二轮在两种基线下都优于均匀 t）；`+reg` 的 GS 也构造 `hyb_risk` / `hyb_risktuned` 混合，可以单独量化检测器的损失；配准 `ok` 只在确实接受了非恒等变换时计为成功（第二轮恒等回退也计入了）；关键对比表按位姿来源分别列出最好的 GS。
+
+## 0.1 第二轮改动（相对 2026-10-24 第一轮实测）
 
 第一轮结论：GS 在光流失败区只比光流高 0.15 dB，且 SSIM/LPIPS 更差；但拼图显示 GS 把魔方补对了，误差主要是**全图几个像素的错位**和 **448 渲染再放大 2.4 倍的模糊**（`rest` 区 GS 19.6 dB vs 光流 33.2 dB）。第二轮针对这两点：
 
@@ -87,17 +111,19 @@ HF_HUB_OFFLINE=1 PYTHONUNBUFFERED=1 bash run_all.sh configs/mofang_9cam.yaml
 python -m unittest discover -s tests -v
 ```
 
-**复用第一轮的 `work/`**：`prepare` 和光流结果与第一轮相同，可以只重跑 GS 和评估（约省一半时间）：
+**复用第二轮的工作目录**（推荐，`work/round2`）：`prepare` 和 uniform/pose/oracle 光流不变，只需标定、重跑 GS、补 `posecal` 光流和评估：
 
 ```bash
-rm -rf work/gs work/eval            # 旧 GS 目录命名不同；即使不删，evaluate 也会自动跳过
-python scripts/run_anysplat.py --config configs/mofang_9cam.yaml
-python scripts/run_flow.py     --config configs/mofang_9cam.yaml --tmodes pose   # t_pose 来自新的 center448 编码，数值应与第一轮几乎相同
-python scripts/evaluate.py     --config configs/mofang_9cam.yaml
+export LGS_WORK_DIR=work/round3
+mkdir -p $LGS_WORK_DIR && cp -r work/round2/{prepare,flow,poses,compat_packages} $LGS_WORK_DIR/
+python scripts/calibrate_rig.py --config configs/mofang_9cam.yaml     # CPU，约 10–20 分钟（BA）
+python scripts/run_anysplat.py  --config configs/mofang_9cam.yaml
+python scripts/run_flow.py      --config configs/mofang_9cam.yaml --tmodes posecal
+python scripts/evaluate.py      --config configs/mofang_9cam.yaml
 python scripts/validate_results.py configs/mofang_9cam.yaml
 ```
 
-预计：AnySplat 2 个设置 × 2 个裁剪各编码 1 次，每次 5 种渲染（1080² 原生渲染每视点几十毫秒）；evaluate 方法数约 66 个（6 光流 + 20 GS + 40 混合），约 10–20 分钟（ECC 配准与 SSIM 在 CPU 上）。
+预计：AnySplat 2 个设置 × 2 个裁剪各编码 1 次，每次 2 种渲染 × 3 种位姿；evaluate 约 8 个光流 + 24 个 GS（含 `+reg`）+ 72 个混合，约 20–30 分钟（ECC 配准与 SSIM 在 CPU 上）。标定只需运行一次；`work/calib/rig.json` 里有完整的 K、畸变、c2w 和误差报告。
 
 ### 各步骤输出（`work/`）
 
@@ -121,22 +147,24 @@ python scripts/validate_results.py configs/mofang_9cam.yaml
 2. `registration.csv`：`center448_in` 的平均位移就是第一轮"全图错位"的量化值；
 3. 拼图中黄色轮廓（object）应套住魔方和手。
 
-### 要回答的问题
+### 要回答的问题（第三轮）
+
+对比基线一律用**最强光流**：cam3 看 `flow_s0.5_pose`，cam5 看 `flow_s1.0_pose`（第二轮各自最好），不再用均匀 t。
 
 | # | 问题 | 看哪里 | 支持混合方案的结果 |
 |---|---|---|---|
-| H1 | 物体区 GS 是否优于光流 | 关键对比表 `object` 列，cam3 | 最好的 GS（尤其 roi 变体）PSNR 高于 `flow_s1.0_uniform`，LPIPS 更低 |
-| H2 | 滤波核是否有效 | `object`/`rest` 表中同一裁剪下 `_in / _nat / _nat_dil / _nat_mip2d / _nat_mip` 的对比 | `_nat_mip` 或 `_nat_dil` 优于 `_in`（更清晰）且不劣于 `_nat`（无孔洞/锯齿） |
-| H3 | ROI 是否优于整幅裁剪 | `gs_roi448_*` vs `gs_center448_*` 在 `object` 区 | roi 更好（放大倍数更小） |
-| H4 | 错位是不是主要损失 | `gs_x` vs `gs_x+reg`、`registration.csv` | 若 `+reg` 在 object 区提升数 dB，说明瓶颈是位姿/内参，下一步应换标定板位姿或在线配准 |
-| H5 | 混合上限 | `hyb_oracle_fail[gs_x+reg]` vs `flow` 在 `fg` | 明显提升（+0.5 dB 以上且 LPIPS 下降）说明路线在位姿准确时成立 |
-| H6 | 现实检测器够不够 | `hyb_risktuned` 与 `hyb_oracle_fail` 的差距；风险扫描表 | 差距小、IoU 高 |
-| H7 | 光流侧改进 | `flow_s1.0_pose`、`flow_s0.5_pose` | 与第一轮一致：pose t 和 scale 0.5 有效 |
+| H1 | 标定位姿能否消除错位 | `registration.csv` / 配准残差表：`_cal`、`_calK` vs 无后缀 | 平均位移从 8–10 px 降到 1–2 px |
+| H2 | 可部署的 GS 是否优于最强光流 | cam3 关键对比表 `object` 列：`gs_*_cal(K)` vs `flow_s0.5_pose` | PSNR 更高且 LPIPS 更低，接近第二轮 `+reg` 的 17.4–17.6 dB |
+| H3 | 可部署的混合是否有效 | `hyb_oracle_fail[gs_*_cal]`、`hyb_risktuned[gs_*_cal]` 在 `fg` | oracle 混合 fg 提升且 LPIPS 不变差；tuned 越接近 oracle，检测器越够用 |
+| H4 | 标定内参与畸变是否必要 | `_calK` vs `_cal` | `_calK` 更好，说明 VGGT 内参也有误差；更差则说明高斯本身是按 VGGT 内参构建的，应保持一致 |
+| H5 | 修正后的 3D 滤波 | `_nat_mip` vs `_nat_dil` | 不再崩溃；若仍无收益，滤波不是瓶颈 |
+| H6 | 时间步与空间位置 | t 估计表、`flow_*_posecal` vs `flow_*_pose` | 若标定 t 比 VGGT t 更差，说明 RIFE 的 t 对空间位置的响应非线性，需要把 t 按网络响应重新标定（例如用留出相机建立查找表），而不是直接用几何比例 |
+| H7 | 小基线 | cam5 | 预期光流仍优于 GS，说明 GS 只应在大基线、光流失败处触发 |
 
 **决策**：
-- H1 成立（尤其 roi + Mip 滤波） → 局部 GS 补全值得继续，下一步重点是位姿精度和检测器；
-- H1 不成立但 H4/H5 成立（`+reg` 后成立） → 路线本身可行，瓶颈是目标相机位姿/内参，先解决标定；
-- 配准后仍不成立 → GS 本身质量不足，应转向几何一致的视差匹配 + 多视图 warp，或以位姿为条件的前馈模型。
+- H1 + H2 成立 → "标定一次 + 局部 GS 补全"在可部署条件下成立，下一步是实验 1 的风险检测和 token 局部推理；
+- H1 成立但 H2 不成立 → 位姿已不是瓶颈，GS 外观质量不足：考虑以位姿为条件的前馈模型、在本阵列数据上微调，或几何一致的视差匹配 + 多视图 warp；
+- H1 不成立 → 错位来自位姿以外（例如 AnySplat 自身输入相机几何与真实阵列不一致，看 AnySplat 统计表中 calib 行的 Sim(3) 残差），需要先定位。
 
 ---
 

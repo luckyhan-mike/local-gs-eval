@@ -35,10 +35,73 @@ class NumericsTests(unittest.TestCase):
         op = torch.tensor([0.8])
         c2w = np.eye(4)[None]
         intr = np.array([[[fx_n, 0, 0.5], [0, fx_n, 0.5], [0, 0, 1]]])
-        cov2, op2, std = mip_filter3d(means, cov, op, c2w, intr, size, var=0.2)
+        cov2, op2, std = mip_filter3d(means, cov, op, c2w, intr, size, var=0.2, compensate=True)
         s2 = 0.2 * (d / (fx_n * size)) ** 2
         np.testing.assert_allclose(cov2[0].numpy(), np.eye(3) * (1e-4 + s2), rtol=1e-5)
         np.testing.assert_allclose(op2.item(), 0.8 * ((1e-4 / (1e-4 + s2)) ** 1.5), rtol=1e-4)
+        _, op3, _ = mip_filter3d(means, cov, op, c2w, intr, size, var=0.2)
+        self.assertAlmostEqual(op3.item(), 0.8, places=6)  # default: no energy compensation
+
+    def test_bundle_adjust_recovers_synthetic_rig(self):
+        import cv2
+        from scripts.calibrate_rig import bundle_adjust, project
+        rng = np.random.default_rng(1)
+        w, h, f = 1920, 1080, 1800.0
+        objp = np.zeros((88, 3))
+        objp[:, :2] = np.mgrid[0:11, 0:8].T.reshape(-1, 2) - [5, 3.5]
+        n = 5
+        rv, tv = [], []
+        for k in range(n):
+            x = (k - 2) * 2.0
+            rot = cv2.Rodrigues(np.array([0.0, np.arctan2(x, 30.0), 0.0]))[0]  # look at the board centre
+            c = np.array([x, 0.5, -30.0])
+            rv.append(cv2.Rodrigues(rot)[0].ravel())
+            tv.append(-rot @ c)
+        rv, tv = np.array(rv), np.array(tv)
+        cx, cy = (w - 1) / 2, (h - 1) / 2
+        k1, k2 = -0.08, 0.2
+        board = {k: project(objp, rv[k], tv[k], f, cx, cy, k1, k2)[0] for k in range(n)}
+        pts = rng.uniform([-6, -6, -3], [6, 6, 3], (300, 3))
+        scene = []
+        for i in range(n):
+            for j in range(i + 1, n):
+                sel = rng.choice(300, 60, replace=False)
+                pi = project(pts[sel], rv[i], tv[i], f, cx, cy, k1, k2)[0]
+                pj = project(pts[sel], rv[j], tv[j], f, cx, cy, k1, k2)[0]
+                scene.append((i, j, pi, pj, pts[sel] + rng.normal(0, 0.05, (60, 3))))
+        K0 = np.array([[f * 1.03, 0, cx], [0, f * 1.03, cy], [0, 0, 1]])
+        pose, fs, (e1, e2), err, _, _ = bundle_adjust(board, objp, scene, K0, np.array([0.0, 0, 0, 0, 0]),
+                                                      rv + rng.normal(0, 0.01, rv.shape),
+                                                      tv + rng.normal(0, 0.2, tv.shape), (w, h), True, 1.5)
+        self.assertLess(np.median(err), 1e-3)
+        np.testing.assert_allclose(fs, f, rtol=1e-3)
+        np.testing.assert_allclose(pose[:, 3:], tv, atol=1e-2)
+
+    def test_distort_maps_match_opencv_projection(self):
+        import cv2
+        from lgs.anysplat_wrap import distort_maps
+        K = np.array([[900.0, 0, 319.5], [0, 900.0, 239.5], [0, 0, 1]])
+        dist = np.array([-0.1, 0.2, 0, 0, 0])
+        und = np.zeros((480, 640), np.float32)
+        und[100, 500] = 1.0  # single bright pixel in the pinhole image
+        mx, my = distort_maps(K, dist, (480, 640))
+        d = cv2.remap(und, mx, my, cv2.INTER_LINEAR)
+        yy, xx = np.unravel_index(np.argmax(d), d.shape)
+        ray = np.array([[(500 - 319.5) / 900, (100 - 239.5) / 900, 1.0]])
+        exp = cv2.projectPoints(ray, np.zeros(3), np.zeros(3), K, dist)[0].ravel()
+        self.assertLess(np.hypot(xx - exp[0], yy - exp[1]), 1.5)
+
+    def test_target_poses_calib_identity_frame(self):
+        from scripts.run_anysplat import target_poses
+        c2w = np.repeat(np.eye(4)[None], 4, 0)
+        c2w[:, 0, 3] = [0, 1, 2, 3]
+        rig = {k: {"c2w": c2w[k], "K": np.array([[1000.0, 0, 959.5], [0, 1000.0, 539.5], [0, 0, 1]]),
+                   "dist": np.zeros(5)} for k in range(4)}
+        state = {"ctx_c2w": c2w[[0, 3]] * 1, "tgt_c2w": c2w[[1, 2]], "tgt_intr": np.repeat(np.eye(3)[None], 2, 0)}
+        out = target_poses(state, [0, 3], [1, 2], (420, 0, 1080), rig, ["vggt", "calib", "calibK"])
+        np.testing.assert_allclose(out["calib"][0], c2w[[1, 2]], atol=1e-9)
+        np.testing.assert_allclose(out["calibK"][1][0], [[1000 / 1080, 0, 539.5 / 1080], [0, 1000 / 1080, 539.5 / 1080],
+                                                         [0, 0, 1]], atol=1e-12)
 
     def test_ecc_registration_recovers_shift(self):
         import cv2

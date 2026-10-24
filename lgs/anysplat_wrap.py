@@ -42,10 +42,13 @@ def rot_angle_deg(ra, rb):
     return float(np.degrees(np.arccos(np.clip(c, -1, 1))))
 
 
-def mip_filter3d(means, cov, opacity, ctx_c2w, ctx_intr_norm, size, var=0.2):
+def mip_filter3d(means, cov, opacity, ctx_c2w, ctx_intr_norm, size, var=0.2, compensate=False):
     """Mip-Splatting 3D smoothing: cov + var*(d/f)^2 I with d/f from the densest context sampling.
 
-    Returns filtered covariances, energy-compensated opacities and the per-Gaussian filter std.
+    Mip-Splatting also scales opacity by sqrt(det cov / det cov'), which assumes the Gaussians were
+    trained with the filter. AnySplat outputs many flat surfels (det cov ~ 0), and that factor drives
+    their opacity to zero post hoc (round 2: transparent surfaces, striped background), so it is off
+    by default. Returns filtered covariances, opacities and the per-Gaussian filter std.
     """
     nu = torch.zeros(len(means), device=means.device)
     for c2w, intr in zip(ctx_c2w, ctx_intr_norm):
@@ -65,9 +68,11 @@ def mip_filter3d(means, cov, opacity, ctx_c2w, ctx_intr_norm, size, var=0.2):
     s2 = var / nu ** 2
     eye = torch.eye(3, device=means.device)
     cov2 = cov + s2[:, None, None] * eye
-    det0 = torch.linalg.det(cov).clamp(min=0)
-    det1 = torch.linalg.det(cov2).clamp(min=1e-30)
-    return cov2, opacity * torch.sqrt(det0 / det1), torch.sqrt(s2)
+    if compensate:
+        det0 = torch.linalg.det(cov).clamp(min=0)
+        det1 = torch.linalg.det(cov2).clamp(min=1e-30)
+        opacity = opacity * torch.sqrt(det0 / det1)
+    return cov2, opacity, torch.sqrt(s2)
 
 
 class AnySplatRunner:
@@ -147,7 +152,8 @@ class AnySplatRunner:
         return state, diag
 
     @torch.no_grad()
-    def render(self, state, c2w, intr_norm, res, mode="classic", eps2d=0.3, filter3d=False, filter3d_var=0.2):
+    def render(self, state, c2w, intr_norm, res, mode="classic", eps2d=0.3, filter3d=False, filter3d_var=0.2,
+               filter3d_comp=False):
         """Render views at res x res. Returns (V,res,res,3) colors, (V,res,res) alpha."""
         g, dev = state["gaussians"], self.device
         means = g.means[0].float()
@@ -155,7 +161,7 @@ class AnySplatRunner:
         op = g.opacities[0].float().reshape(-1)
         if filter3d:
             cov, op, _ = mip_filter3d(means, cov, op, state["ctx_c2w"], state["ctx_intr"],
-                                      state["size"], filter3d_var)
+                                      state["size"], filter3d_var, filter3d_comp)
         feat = g.harmonics[0].permute(0, 2, 1).float().contiguous()  # N,K,3
         sh_degree = int(round(np.sqrt(feat.shape[1]))) - 1
         bg = self.model.decoder.background_color.float().to(dev)[None]
@@ -174,8 +180,21 @@ class AnySplatRunner:
         return np.stack(colors), np.stack(alphas)
 
 
-def paste_and_warp(render, alpha, window, raw_shape, homography, aligned_shape):
-    """Put a square crop render back into the raw frame, then warp into the aligned frame."""
+def distort_maps(K, dist, raw_shape):
+    """remap() maps that turn an undistorted pinhole full-frame image into the distorted raw image."""
+    h, w = raw_shape
+    xs, ys = np.meshgrid(np.arange(w, dtype=np.float32), np.arange(h, dtype=np.float32))
+    pts = np.stack([xs.ravel(), ys.ravel()], 1)[:, None]
+    und = cv2.undistortPoints(pts, np.asarray(K, np.float64), np.asarray(dist, np.float64),
+                              P=np.asarray(K, np.float64)).reshape(h, w, 2)
+    return und[..., 0].astype(np.float32), und[..., 1].astype(np.float32)
+
+
+def paste_and_warp(render, alpha, window, raw_shape, homography, aligned_shape, dmap=None):
+    """Put a square crop render back into the raw frame, then warp into the aligned frame.
+
+    dmap: optional distort_maps() output when the render used calibrated (undistorted) intrinsics.
+    """
     x0, y0, side = window
     h, w = raw_shape
     canvas = np.zeros((h, w, 3), np.float32)
@@ -185,6 +204,10 @@ def paste_and_warp(render, alpha, window, raw_shape, homography, aligned_shape):
     acanvas[y0:y0 + side, x0:x0 + side] = cv2.resize(alpha, (side, side), interpolation=cv2.INTER_LINEAR)
     win = np.zeros((h, w), np.uint8)
     win[y0:y0 + side, x0:x0 + side] = 1
+    if dmap is not None:
+        canvas = cv2.remap(canvas, *dmap, cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT)
+        acanvas = cv2.remap(acanvas, *dmap, cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT)
+        win = cv2.remap(win, *dmap, cv2.INTER_NEAREST, borderMode=cv2.BORDER_CONSTANT)
     ha, wa = aligned_shape
     rgb = cv2.warpPerspective(canvas, homography, (wa, ha), flags=cv2.INTER_LINEAR)
     a = cv2.warpPerspective(acanvas, homography, (wa, ha), flags=cv2.INTER_LINEAR)

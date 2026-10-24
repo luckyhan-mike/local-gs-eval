@@ -35,18 +35,19 @@ def main():
     warnings = []
     for setup in cfg["setups"]:
         _, targets = setup_cams(cfg, setup)
-        for crop in gcfg["crops"]:
-            for size in gcfg["sizes"]:
-                for rv in gcfg["renders"]:
-                    folder = work / "gs" / setup / f"gs_{crop}{size}_{rv['name']}"
-                    meta = load_json(folder / "meta.json")
-                    if max(meta["ctx_rot_err_deg"]) >= 1 or max(meta["ctx_center_err_rel_baseline"]) >= 0.05:
-                        warnings.append(f"pose alignment above threshold: {folder.name}")
-                    for k in targets:
-                        assert imread_rgb(folder / f"cam{k}.png").shape[2] == 3
-                        counts["gs_renders"] += 1
+        suffix = {"vggt": "", "calib": "_cal", "calibK": "_calK"}
+        variants = [f"gs_{crop}{size}_{rv['name']}{suffix[src]}" for crop in gcfg["crops"] for size in gcfg["sizes"]
+                    for rv in gcfg["renders"] for src in gcfg.get("pose_sources", ["vggt"])]
+        for variant in variants:
+            folder = work / "gs" / setup / variant
+            meta = load_json(folder / "meta.json")
+            if max(meta["ctx_rot_err_deg"]) >= 1 or max(meta["ctx_center_err_rel_baseline"]) >= 0.05:
+                warnings.append(f"pose alignment above threshold: {folder.name}")
+            for k in targets:
+                assert imread_rgb(folder / f"cam{k}.png").shape[2] == 3
+                counts["gs_renders"] += 1
         for scale in (1.0, 0.5):
-            for mode in ("uniform", "pose", "oracle"):
+            for mode in ("uniform", "pose", "posecal", "oracle"):
                 folder = work / "flow" / setup / f"flow_s{scale}_{mode}"
                 meta = load_json(folder / "meta.json")
                 assert set(meta) == {str(k) for k in targets}

@@ -2,7 +2,8 @@
 """Step 2: RIFE synthesis of every held-out camera from its two nearest context cameras.
 
 t modes: uniform (index fraction, what the current pipeline does), pose (from AnySplat/VGGT
-camera centers, run_anysplat.py must run first), oracle (grid search against GT; upper bound).
+camera centers, run_anysplat.py must run first), posecal (offline rig calibration, calibrate_rig.py),
+oracle (grid search against GT; upper bound).
 Outputs: work/flow/<setup>/flow_s<scale>_<tmode>/cam{k}.png, cam{k}_signals.npz, meta.json
 """
 import argparse
@@ -34,7 +35,7 @@ def main():
     ap.add_argument("--config", required=True)
     ap.add_argument("--setups", nargs="+", default=None)
     ap.add_argument("--scales", nargs="+", type=float, default=[1.0, 0.5])
-    ap.add_argument("--tmodes", nargs="+", default=["uniform", "pose", "oracle"])
+    ap.add_argument("--tmodes", nargs="+", default=["uniform", "pose", "posecal", "oracle"])
     args = ap.parse_args()
     cfg = load_cfg(args.config)
     work = Path(cfg["work_dir"])
@@ -42,11 +43,15 @@ def main():
 
     for setup in args.setups or list(cfg["setups"]):
         ctx, targets = setup_cams(cfg, setup)
-        pose_file = work / "poses" / f"{setup}.json"
-        t_pose = load_json(pose_file)["t_pose"] if pose_file.exists() else None
-        tmodes = [m for m in args.tmodes if m != "pose" or t_pose is not None]
-        if "pose" in args.tmodes and t_pose is None:
-            print(f"[{setup}] 未找到 {pose_file}，跳过 t_pose（请先运行 run_anysplat.py）")
+        t_src = {}
+        for mode, name, hint in (("pose", f"{setup}.json", "run_anysplat.py"),
+                                 ("posecal", f"{setup}_calib.json", "calibrate_rig.py")):
+            f = work / "poses" / name
+            if f.exists():
+                t_src[mode] = load_json(f)["t_pose"]
+            elif mode in args.tmodes:
+                print(f"[{setup}] 未找到 {f}，跳过 t_{mode}（请先运行 {hint}）")
+        tmodes = [m for m in args.tmodes if m not in ("pose", "posecal") or m in t_src]
         imgs = {k: imread_rgb(cam_path(cfg, "aligned", k)) for k in range(ctx[0], ctx[-1] + 1)}
         for scale in args.scales:
             for tmode in tmodes:
@@ -59,8 +64,8 @@ def main():
                     fg = read_mask(work / "prepare" / f"fg_aligned_{k:02d}.png")
                     if tmode == "uniform":
                         t = (k - a) / (b - a)
-                    elif tmode == "pose":
-                        t = float(np.clip(t_pose[str(k)], 0, 1))
+                    elif tmode in t_src:
+                        t = float(np.clip(t_src[tmode][str(k)], 0, 1))
                     else:
                         t = oracle_t(rife, imgs[a], imgs[b], gt, fg, scale)
                     res = rife.synth(imgs[a], imgs[b], t, scale)

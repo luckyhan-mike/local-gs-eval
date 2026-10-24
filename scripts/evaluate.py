@@ -158,15 +158,16 @@ def main():
             gs_vars = [gv for gv in gs_vars if gv not in stale]
             gs_meta = {gv: gs_meta[gv] for gv in gs_vars}
         for gv, m in gs_meta.items():
-            gs_rows.append([setup, gv, m["crop"], m["window"][2], m["render_res"], m["render"]["mode"],
+            pd = m.get("pose_diag") or m
+            gs_rows.append([setup, gv, m.get("pose_source", "vggt"), m["window"][2], m["render_res"], m["render"]["mode"],
                             m["eps2d_used"], m["render"]["filter3d"], m["num_gaussians"], m["time_encode_s"],
                             m["time_render_per_view_s"], float(np.mean(m["ctx_self_psnr"])),
-                            max(m["ctx_rot_err_deg"]), max(m["ctx_center_err_rel_baseline"])])
+                            max(pd["ctx_rot_err_deg"]), max(pd["ctx_center_err_rel_baseline"])])
         full_frame = [gv for gv in gs_vars if gs_meta[gv]["crop"] != "roi"]
         flow_meta = {fv: load_json(flow_dir / fv / "meta.json") for fv in flow_vars}
         for k in targets:
             t_rows.append([setup, k] + [flow_meta.get(f"flow_s1.0_{m}", {}).get(str(k), {}).get("t", float("nan"))
-                                        for m in ("uniform", "pose", "oracle")])
+                                        for m in ("uniform", "pose", "posecal", "oracle")])
 
         # ---------- pass 1: oracle failure regions and the risk-threshold sweep
         base = {}
@@ -236,12 +237,11 @@ def main():
                     preds[g2] = warp_by(p, hmat)
                     cover[g2] = warp_by(v.astype(np.float32), hmat) > 0.5
                     gs_ok[g2] = warp_by(ok, hmat)
-                reg_rows.append([setup, k, gv, disp, hmat is not None])
+                # ok = a registration stage was accepted (identity fallback is not counted as success)
+                reg_rows.append([setup, k, gv, disp, hmat is not None and not np.allclose(hmat, np.eye(3))])
 
             for gv in list(gs_ok):
-                hybs = {"hyb_oracle_fail": reg["oracle_fail"]}
-                if "+reg" not in gv:
-                    hybs.update(hyb_risk=reg["risk"], hyb_risktuned=risk_tuned)
+                hybs = {"hyb_oracle_fail": reg["oracle_fail"], "hyb_risk": reg["risk"], "hyb_risktuned": risk_tuned}
                 for hname, region in hybs.items():
                     m = f"{hname}[{gv}]"
                     preds[m] = blend(preds[ref], preds[gv], region, gs_ok[gv], ecfg["feather_sigma"])
@@ -328,19 +328,26 @@ def write_summary(path, rows, auc_rows, t_rows, gs_rows, reg_rows, sweep_rows, t
              "`覆盖` = 该方法有渲染结果的像素占区域的比例（ROI 渲染只覆盖局部）。"
              "`+reg` 表示用真值做 ECC 单应配准后的 GS（诊断用上限，不是可部署的方法）。", ""]
     setups = sorted({r[0] for r in rows})
+    def pose_src(m):
+        return "calibK" if m.endswith("_calK") else "calib" if m.endswith("_cal") else "vggt"
+
     for s in setups:
         gsv = sorted({m for (ss, r, m) in agg if ss == s and m.startswith("gs_") and "+reg" not in m})
-        best = max(gsv, key=lambda m: mean(s, "object", m, 0)) if gsv else None
-        best_center = max([m for m in gsv if "center" in m], key=lambda m: mean(s, "object", m, 0), default=None)
-        lines += [f"## 设置 {s}", "", f"物体区 PSNR 最好的 GS 变体：`{best}`；整幅裁剪中最好的：`{best_center}`。"
-                  f"调优风险阈值（扫描 IoU 最优）：warp={tuned[s][0]}, col={tuned[s][1]}。", "",
+        best_by_src = {}
+        for src in ("vggt", "calib", "calibK"):
+            cands = [m for m in gsv if pose_src(m) == src]
+            if cands:
+                best_by_src[src] = max(cands, key=lambda m: mean(s, "object", m, 0))
+        lines += [f"## 设置 {s}", "",
+                  "按目标位姿来源分别选出物体区 PSNR 最好的 GS 变体：" +
+                  "，".join(f"{src} → `{g}`" for src, g in best_by_src.items()) +
+                  f"。调优风险阈值（扫描 IoU 最优）：warp={tuned[s][0]}, col={tuned[s][1]}。", "",
                   "### 关键对比", "", "| 方法 | " + " | ".join(f"{r} PSNR / LPIPS" for r in ("object", "oracle_fail", "rest", "fg")) + " |",
                   "|---|" + "---:|" * 4]
-        key = [ref, "flow_s1.0_pose", "flow_s0.5_pose"]
-        for g in [best_center, best]:
-            if g:
-                key += [g, f"{g}+reg", f"hyb_oracle_fail[{g}]", f"hyb_oracle_fail[{g}+reg]",
-                        f"hyb_risktuned[{g}]", f"hyb_risk[{g}]"]
+        key = ["flow_s1.0_uniform", "flow_s1.0_pose", "flow_s1.0_posecal", "flow_s0.5_pose", "flow_s0.5_posecal", ref]
+        for g in best_by_src.values():
+            key += [g, f"{g}+reg", f"hyb_oracle_fail[{g}]", f"hyb_risktuned[{g}]",
+                    f"hyb_oracle_fail[{g}+reg]", f"hyb_risktuned[{g}+reg]"]
         seen = set()
         for m in key:
             if m in seen or not any((s, r, m) in agg for r in REGIONS):
@@ -379,15 +386,17 @@ def write_summary(path, rows, auc_rows, t_rows, gs_rows, reg_rows, sweep_rows, t
             lines.append(f"| {s} | {fmt(r[1], 2)}{tag} | {col} | {fmt(r[3], 3)} | {fmt(r[4], 3)} | "
                          f"{fmt(r[5], 3)} | {fmt(r[6], 2)} |")
 
-    lines += ["", "## t 估计对比（scale=1.0）", "", "| 设置 | 目标相机 | t_uniform | t_pose | t_oracle |",
-              "|---|---:|---:|---:|---:|"]
-    lines += [f"| {s} | {k} | {fmt(a, 3)} | {fmt(b, 3)} | {fmt(c, 3)} |" for s, k, a, b, c in t_rows]
+    lines += ["", "## t 估计对比（scale=1.0）", "",
+              "| 设置 | 目标相机 | t_uniform | t_pose (VGGT) | t_posecal (标定) | t_oracle |", "|---|---:|---:|---:|---:|---:|"]
+    lines += [f"| {s} | {k} | {fmt(a, 3)} | {fmt(b, 3)} | {fmt(c, 3)} | {fmt(d, 3)} |" for s, k, a, b, c, d in t_rows]
     lines += ["", "## AnySplat 运行统计", "",
-              "| 设置 | 变体 | 窗口边长 | 渲染分辨率 | 模式 | eps2d | 3D 滤波 | 高斯数 | 编码 s | 渲染 ms/视点 | 输入视点自渲染 PSNR | 最大旋转误差° | 最大光心误差/基线 |",
-              "|---|---|---:|---:|---|---:|---|---:|---:|---:|---:|---:|---:|"]
-    lines += [f"| {s} | {g} | {side} | {res} | {mode} | {fmt(eps, 2)} | {f3} | {n} | {fmt(te, 3)} | "
+              "旋转/光心误差：vggt 行是联合估计与输入视点估计的一致性；calib/calibK 行是标定位姿经 Sim(3) 对齐到"
+              "AnySplat 输入视点位姿后的残差（反映 AnySplat 自身预测的输入相机几何与真实阵列的偏差）。", "",
+              "| 设置 | 变体 | 位姿来源 | 窗口边长 | 渲染分辨率 | 模式 | eps2d | 3D 滤波 | 高斯数 | 编码 s | 渲染 ms/视点 | 输入视点自渲染 PSNR | 最大旋转误差° | 最大光心误差/基线 |",
+              "|---|---|---|---:|---:|---|---:|---|---:|---:|---:|---:|---:|---:|"]
+    lines += [f"| {s} | {g} | {src} | {side} | {res} | {mode} | {fmt(eps, 2)} | {f3} | {n} | {fmt(te, 3)} | "
               f"{fmt(tr * 1000, 1)} | {fmt(cp)} | {fmt(re)} | {fmt(ce, 3)} |"
-              for s, g, crop, side, res, mode, eps, f3, n, te, tr, cp, re, ce in gs_rows]
+              for s, g, src, side, res, mode, eps, f3, n, te, tr, cp, re, ce in gs_rows]
     lines += ["", "## 光流自身信号预测“光流失败”的 AUC（标签 = oracle_fail，0.5 = 随机）", "",
               "| 设置 | 信号 | 平均 AUC | 前景失败率 |", "|---|---|---:|---:|"]
     by = defaultdict(list)
