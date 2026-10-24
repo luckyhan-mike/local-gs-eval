@@ -91,6 +91,34 @@ class NumericsTests(unittest.TestCase):
         exp = cv2.projectPoints(ray, np.zeros(3), np.zeros(3), K, dist)[0].ravel()
         self.assertLess(np.hypot(xx - exp[0], yy - exp[1]), 1.5)
 
+    def test_token_keep_selects_rays_through_mask(self):
+        import torch
+        from lgs.anysplat_wrap import token_keep
+        c2w = np.eye(4)[None]
+        intr = np.array([[[1.0, 0, 0.5], [0, 1.0, 0.5], [0, 0, 1]]])
+        mask = np.zeros((100, 100), bool)
+        mask[40:60, 40:60] = True
+        means = torch.tensor([[0.0, 0.0, 2.0], [0.0, 0.0, 9.0], [0.4, 0.0, 2.0], [0.0, 0.0, -1.0]])
+        keep = token_keep(means, c2w, intr, [mask]).numpy()
+        # both points on the central ray are kept (foreground and the background behind it)
+        self.assertEqual(keep.tolist(), [True, True, False, False])
+
+    def test_interp_pose_endpoints_and_midpoint(self):
+        from scipy.spatial.transform import Rotation
+        from lgs.anysplat_wrap import interp_pose
+        a, b = np.eye(4), np.eye(4)
+        b[:3, :3] = Rotation.from_euler("y", 20, degrees=True).as_matrix()
+        b[:3, 3] = [2, 0, 0]
+        ka, kb = np.eye(3), np.eye(3) * 2
+        p0, k0 = interp_pose(a, b, ka, kb, 0.0)
+        p1, _ = interp_pose(a, b, ka, kb, 1.0)
+        pm, km = interp_pose(a, b, ka, kb, 0.5)
+        np.testing.assert_allclose(p0, a, atol=1e-12)
+        np.testing.assert_allclose(p1, b, atol=1e-12)
+        self.assertAlmostEqual(Rotation.from_matrix(pm[:3, :3]).as_euler("xyz", degrees=True)[1], 10, places=6)
+        np.testing.assert_allclose(pm[:3, 3], [1, 0, 0])
+        np.testing.assert_allclose(km, np.eye(3) * 1.5)
+
     def test_target_poses_calib_identity_frame(self):
         from scripts.run_anysplat import target_poses
         c2w = np.repeat(np.eye(4)[None], 4, 0)

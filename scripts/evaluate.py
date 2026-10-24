@@ -45,6 +45,20 @@ def risk_from_signals(sig, near_fg, warp_t, col_t, rcfg):
     return dilate(raw & near_fg, rcfg["dilate_px"]) & near_fg
 
 
+def read_alpha(path):
+    return cv2.imdecode(np.fromfile(str(path), np.uint8), 0) / 255.0
+
+
+def paste_weight(core, gs_ok, feather):
+    """1 inside the token core, fading to 0 over `feather` px outside it (inside the reconstruction margin)."""
+    w = cv2.GaussianBlur(dilate(core, feather // 2).astype(np.float32), (0, 0), max(feather / 3, 0.5))
+    return np.clip(np.maximum(w, core.astype(np.float32)), 0, 1) * (gs_ok > 0.5)
+
+
+def blend_w(flow, gs, w):
+    return flow * (1 - w[..., None]) + gs * w[..., None]
+
+
 def blend(flow, gs, region, gs_ok, sigma):
     w = cv2.GaussianBlur(region.astype(np.float32), (0, 0), sigma) if sigma > 0 else region.astype(np.float32)
     w = np.maximum(w, region.astype(np.float32)) * gs_ok
@@ -136,11 +150,12 @@ def main():
     args = ap.parse_args()
     cfg = load_cfg(args.config)
     work = Path(cfg["work_dir"])
-    ecfg, rcfg, ck = cfg["eval"], cfg["risk"], cfg["chroma"]
+    ecfg, rcfg, ck, tcfg = cfg["eval"], cfg["risk"], cfg["chroma"], cfg["tokens"]
     out_dir = work / "eval"
     out_dir.mkdir(parents=True, exist_ok=True)
     lp = LPIPSRegion("cuda" if torch.cuda.is_available() else "cpu")
     rows, auc_rows, t_rows, gs_rows, reg_rows, sweep_rows, tuned = [], [], [], [], [], [], {}
+    paste_rows, token_rows = [], []
     ref = ecfg["ref_flow"]
 
     for setup in args.setups or list(cfg["setups"]):
@@ -163,7 +178,7 @@ def main():
                             m["eps2d_used"], m["render"]["filter3d"], m["num_gaussians"], m["time_encode_s"],
                             m["time_render_per_view_s"], float(np.mean(m["ctx_self_psnr"])),
                             max(pd["ctx_rot_err_deg"]), max(pd["ctx_center_err_rel_baseline"])])
-        full_frame = [gv for gv in gs_vars if gs_meta[gv]["crop"] != "roi"]
+        full_frame = [gv for gv in gs_vars if gs_meta[gv]["crop"] in ("center", "fg")]
         flow_meta = {fv: load_json(flow_dir / fv / "meta.json") for fv in flow_vars}
         for k in targets:
             t_rows.append([setup, k] + [flow_meta.get(f"flow_s1.0_{m}", {}).get(str(k), {}).get("t", float("nan"))
@@ -223,12 +238,35 @@ def main():
             preds = {fv: load_rgb(flow_dir / fv / f"cam{k}.png") for fv in flow_vars}
             cover = {m: np.ones(gt.shape[:2], bool) for m in preds}
             gs_ok = {}
+            paste = {}
             for gv in gs_vars:
                 p = load_rgb(gs_dir / gv / f"cam{k}.png")
                 v = read_mask(gs_dir / gv / f"cam{k}_valid.png")
-                a = cv2.imdecode(np.fromfile(str(gs_dir / gv / f"cam{k}_alpha.png"), np.uint8), 0) / 255.0
+                a = read_alpha(gs_dir / gv / f"cam{k}_alpha.png")
                 ok = (v & (a > 0.5)).astype(np.float32)
                 preds[gv], cover[gv], gs_ok[gv] = p, v, ok
+                if gs_meta[gv].get("local"):
+                    # Token paste-back: the region is where the token core projects into this view.
+                    core = (read_alpha(gs_dir / gv / f"cam{k}_alpha_core.png") > 0.5) & v
+                    paste[gv] = core
+                    tok_w = paste_weight(core, ok, tcfg["paste_feather_px"])
+                    preds[f"hyb_token[{gv}]"] = blend_w(preds[ref], p, tok_w)
+                    # GT-free alignment: register the GS patch to the flow result on the reliable ring
+                    ring = dilate(core, tcfg["ring_px"]) & ~dilate(core, tcfg["paste_feather_px"]) & (ok > 0)
+                    hmat, rdisp = register(p, preds[ref], ring)
+                    if hmat is not None and rdisp > tcfg["ring_max_disp_px"]:
+                        hmat = None  # implausible fit (ring too small or flow wrong there): paste unaligned
+                    if hmat is not None:
+                        p2, ok2 = warp_by(p, hmat), warp_by(ok, hmat)
+                        core2 = warp_by(core.astype(np.float32), hmat) > 0.5
+                        preds[f"hyb_token_ringreg[{gv}]"] = blend_w(preds[ref], p2,
+                                                                    paste_weight(core2, ok2, tcfg["paste_feather_px"]))
+                    else:
+                        preds[f"hyb_token_ringreg[{gv}]"] = preds[f"hyb_token[{gv}]"]
+                    for m in (f"hyb_token[{gv}]", f"hyb_token_ringreg[{gv}]"):
+                        cover[m] = np.ones(gt.shape[:2], bool)
+                    token_rows.append([setup, k, gv, float(core.sum() / max(fg.sum(), 1)), rdisp])
+                    continue  # local GS is only meant to be pasted back; skip GT registration/other hybrids
                 # Fit on the whole foreground except the scored object area, so the object gain is not fitted.
                 reg_mask = fg & (ok > 0) & ~reg["object"]
                 hmat, disp = register(p, gt, reg_mask)
@@ -240,7 +278,7 @@ def main():
                 # ok = a registration stage was accepted (identity fallback is not counted as success)
                 reg_rows.append([setup, k, gv, disp, hmat is not None and not np.allclose(hmat, np.eye(3))])
 
-            for gv in list(gs_ok):
+            for gv in [g for g in gs_ok if not gs_meta[gs_base(g)].get("local")]:
                 hybs = {"hyb_oracle_fail": reg["oracle_fail"], "hyb_risk": reg["risk"], "hyb_risktuned": risk_tuned}
                 for hname, region in hybs.items():
                     m = f"{hname}[{gv}]"
@@ -261,6 +299,17 @@ def main():
                     rows.append([setup, k, meth, rname, psnr(p, gt, m), float(np.nanmean(smap[m])),
                                  lp(p, gt, m), int(m.sum()), float(region.sum() / nfg),
                                  float(m.sum() / max(region.sum(), 1))])
+            # Paste region of each local GS variant: pure flow vs the two paste-back hybrids on the same pixels
+            for gv, m in paste.items():
+                if not m.any():
+                    continue
+                for meth in (ref, f"hyb_token[{gv}]", f"hyb_token_ringreg[{gv}]"):
+                    p = preds[meth]
+                    sm = ssim_map(p[y0:y1, x0:x1], gt[y0:y1, x0:x1])
+                    full = np.full(gt.shape[:2], np.nan, np.float32)
+                    full[y0:y1, x0:x1] = sm
+                    paste_rows.append([setup, k, gv, meth, psnr(p, gt, m), float(np.nanmean(full[m])), lp(p, gt, m),
+                                       float(m.sum() / nfg)])
 
             # montage around the object / failure area
             box = bbox(reg["object"] | reg["oracle_fail"] & dilate(reg["object"], 120), 40) or bbox(fg, 16)
@@ -273,8 +322,29 @@ def main():
                 y0, y1 = max(c - 160, 0), min(c + 160, gt.shape[0])
             box = (x0, y0, x1, y1)
             tiles = [tile("GT", gt, box, 260), tile(ref, preds[ref], box, 260)]
-            if gs_vars:
-                best_gv = max(gs_vars, key=lambda g: psnr(preds[g], gt, reg["object"] & cover[g])
+
+            def err_tile(name, p):
+                return tile(name, np.repeat(np.abs(p - gt).mean(-1, keepdims=True) * 3, 3, -1), box, 260)
+
+            local = [g for g in paste if paste[g].any()]
+            if local:
+                best_lv = max(local, key=lambda g: psnr(preds[f"hyb_token_ringreg[{g}]"], gt, paste[g]))
+                tiles += [tile(best_lv, np.where(paste[best_lv][..., None], preds[best_lv], gt * 0.3), box, 260),
+                          tile("hyb_token", preds[f"hyb_token[{best_lv}]"], box, 260),
+                          tile("hyb_token_ringreg", preds[f"hyb_token_ringreg[{best_lv}]"], box, 260),
+                          err_tile("|err| flow x3", preds[ref]),
+                          err_tile("|err| hyb_token x3", preds[f"hyb_token[{best_lv}]"]),
+                          err_tile("|err| ringreg x3", preds[f"hyb_token_ringreg[{best_lv}]"])]
+                ov = gt.copy()
+                pm = paste[best_lv]
+                ov[pm] = 0.5 * ov[pm] + 0.5 * np.array((0, 0.3, 1), np.float32)
+                ov[dilate(reg["object"], 2) & ~reg["object"]] = (1, 1, 0)
+                tiles.append(tile("blue=paste region yellow=object", ov, box, 260))
+                imwrite(out_dir / setup / f"cam{k}_montage.png", grid(tiles, 5))
+                tiles = [tile("GT", gt, box, 260), tile(ref, preds[ref], box, 260)]
+            full_vars = [g for g in gs_vars if not gs_meta[g].get("local")]
+            if full_vars:
+                best_gv = max(full_vars, key=lambda g: psnr(preds[g], gt, reg["object"] & cover[g])
                               if (reg["object"] & cover[g]).any() else -1)
                 errs = [("|err| flow x3", preds[ref])]
                 tiles.append(tile(best_gv, preds[best_gv], box, 260))
@@ -291,7 +361,8 @@ def main():
                 ov[m] = 0.5 * ov[m] + 0.5 * np.array(color, np.float32)
             ov[dilate(reg["object"], 2) & ~reg["object"]] = (1, 1, 0)
             tiles.append(tile("red=oracle blue=risk_tuned yellow=object", ov, box, 260))
-            imwrite(out_dir / setup / f"cam{k}_montage.png", grid(tiles, 5))
+            imwrite(out_dir / setup / (f"cam{k}_montage_fullgs.png" if local else f"cam{k}_montage.png"),
+                    grid(tiles, 5))
             print(f"[{setup}] cam{k}: oracle_fail={reg['oracle_fail'].sum() / nfg:.3f} "
                   f"risk={reg['risk'].sum() / nfg:.3f} risk_tuned={risk_tuned.sum() / nfg:.3f} "
                   f"object={reg['object'].sum() / nfg:.3f}")
@@ -308,11 +379,17 @@ def main():
     write_csv("registration.csv", ["setup", "target", "gs_variant", "mean_disp_px", "ok"], reg_rows)
     write_csv("risk_sweep.csv", ["setup", "warp_thresh", "col_thresh", "precision", "recall", "iou",
                                  "area_ratio"], sweep_rows)
-    write_summary(out_dir / "summary.md", rows, auc_rows, t_rows, gs_rows, reg_rows, sweep_rows, tuned, rcfg, ref)
+    write_csv("paste.csv", ["setup", "target", "local_variant", "method", "psnr", "ssim", "lpips",
+                            "paste_area_frac_fg"], paste_rows)
+    write_csv("token_ringreg.csv", ["setup", "target", "local_variant", "paste_area_frac_fg", "ring_disp_px"],
+              token_rows)
+    write_summary(out_dir / "summary.md", rows, auc_rows, t_rows, gs_rows, reg_rows, sweep_rows, tuned, rcfg, ref,
+                  paste_rows, token_rows)
     print(f"done -> {out_dir / 'summary.md'}")
 
 
-def write_summary(path, rows, auc_rows, t_rows, gs_rows, reg_rows, sweep_rows, tuned, rcfg, ref):
+def write_summary(path, rows, auc_rows, t_rows, gs_rows, reg_rows, sweep_rows, tuned, rcfg, ref,
+                  paste_rows=(), token_rows=()):
     agg = defaultdict(list)
     area = defaultdict(list)
     for s, k, meth, r, p, ss, l, apx, afr, cov in rows:
@@ -323,11 +400,45 @@ def write_summary(path, rows, auc_rows, t_rows, gs_rows, reg_rows, sweep_rows, t
         v = np.array(agg.get((s, r, m), []), dtype=np.float64)
         return float(np.nanmean(v[:, i])) if len(v) else float("nan")
 
-    lines = ["# 局部 GS 质量验证结果汇总（第二轮：Mip 滤波 + ROI + 配准诊断）", "",
+    lines = ["# 局部 GS 质量验证结果汇总", "",
              "指标为各留出相机的平均值；PSNR/SSIM 越高越好，LPIPS 越低越好。"
              "`覆盖` = 该方法有渲染结果的像素占区域的比例（ROI 渲染只覆盖局部）。"
              "`+reg` 表示用真值做 ECC 单应配准后的 GS（诊断用上限，不是可部署的方法）。", ""]
     setups = sorted({r[0] for r in rows})
+
+    if paste_rows:
+        lines += ["## Token 局部 GS 贴回（主结果：输入相机标记 → 局部 GS → 虚拟视点贴回，全程不用真值）", "",
+                  f"`{ref}` 为纯光流；`hyb_token[v]` 直接贴回；`hyb_token_ringreg[v]` 先在贴回区外环用光流结果配准 GS 块"
+                  "（不用真值）再贴回。真值只用于计算指标。", "",
+                  "### 贴回区内（同一组像素）", "",
+                  "| 设置 | 局部变体 | 贴回区占前景 | 光流 PSNR / LPIPS | 直接贴回 PSNR / LPIPS | 环带配准 PSNR / LPIPS | 环带位移 px |",
+                  "|---|---|---:|---:|---:|---:|---:|"]
+        pr = defaultdict(list)
+        for s, k, gv, meth, p, ss, l, fr in paste_rows:
+            kind = "flow" if meth == ref else "ringreg" if "ringreg" in meth else "token"
+            pr[(s, gv, kind)].append((p, l, fr))
+        rd = defaultdict(list)
+        for s, k, gv, fr, d in token_rows:
+            rd[(s, gv)].append(d)
+        for s, gv in sorted({(s, gv) for s, gv, _ in pr}):
+            def cell(kind):
+                v = np.array(pr.get((s, gv, kind), []), dtype=np.float64)
+                return f"{fmt(np.nanmean(v[:, 0]))} / {fmt(np.nanmean(v[:, 1]), 4)}" if len(v) else "—"
+            fr = np.mean([x[2] for x in pr[(s, gv, "flow")]]) if pr.get((s, gv, "flow")) else float("nan")
+            d = np.array(rd.get((s, gv), [np.nan]), dtype=np.float64)
+            lines.append(f"| {s} | {gv} | {fmt(fr * 100, 1)}% | {cell('flow')} | {cell('token')} | {cell('ringreg')} | "
+                         f"{fmt(np.nanmean(d) if np.isfinite(d).any() else float('nan'))} |")
+        lines += ["", "### 整图与物体区（PSNR / LPIPS）", "",
+                  "| 设置 | 方法 | fg | object | oracle_fail | rest |", "|---|---|---:|---:|---:|---:|"]
+        tok_methods = sorted({m for (s, r, m) in agg if m.startswith("hyb_token")})
+        for s in setups:
+            for m in [ref, "flow_s0.5_pose"] + tok_methods:
+                if not any((s, r, m) in agg for r in REGIONS):
+                    continue
+                cells = [f"{fmt(mean(s, r, m, 0))} / {fmt(mean(s, r, m, 2), 4)}"
+                         for r in ("fg", "object", "oracle_fail", "rest")]
+                lines.append(f"| {s} | {m} | " + " | ".join(cells) + " |")
+        lines += ["", "## 其余诊断（整窗口 GS、用真值配准的上限等）", ""]
     def pose_src(m):
         return "calibK" if m.endswith("_calK") else "calib" if m.endswith("_cal") else "vggt"
 

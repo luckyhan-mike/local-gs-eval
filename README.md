@@ -14,7 +14,39 @@
 
 ---
 
-## 0. 第三轮改动（相对第二轮实测）
+## 0. 第四轮：按原始框架做 token 局部 GS（当前主实验）
+
+前三轮的不可靠区域都定义在**虚拟视点（目标图）**上，GS 也是对整个裁剪窗口重建，这和原始框架不一致。第四轮改为：
+
+```
+3 台真实输入相机 ──► detect_tokens.py：在输入图像上标记不可靠区域（不使用真值）
+                      · 遮挡 / 匹配失败：DIS 双向光流前后向不一致 且 光度不一致
+                      · 光流失败：RIFE（合成用的同一网络）在 t=0.5 的 |W0−W1| 与双向共线残差，
+                                   沿 RIFE 自身的对应关系映射回两张源图
+                      · 深度突变：RIFE t=0.5 视差的大跳变（阈值 2.0，只取魔方-头发这类大跳变）
+                      core  = 标记 + 6 px            → 贴回区
+                      recon = core + 48 px 周围区域  → 重建区（保证 token 周围的场景也重建准确）
+         │
+         ▼
+run_anysplat.py：窗口 = 各输入相机重建区外接框；AnySplat 编码后只保留视线穿过重建区的高斯
+                 （前景与其后方背景都保留）= 局部 GS 点云（变体后缀 _local）
+         │
+         ▼
+虚拟视点：光流生成完整图；局部 GS 在同一虚拟相机渲染，在 core 的投影范围内贴回（羽化在 recon 边距内）
+         │
+         ▼
+与纯光流整图对比（真值只用于算指标）
+```
+
+**统一位姿坐标系（`_int` 变体）**：GS 不再使用独立估计的目标相机位姿，而是在高斯坐标系里用两侧输入相机的位姿，按**光流同一个 t** 插值（旋转 slerp、位置与内参线性插值）。高斯本身与这些输入相机位姿自洽，光流与 GS 描述的是同一个虚拟相机。对比 `''`（VGGT 联合估计的目标位姿）。
+
+**环带配准（`hyb_token_ringreg`，不用真值）**：光流在 2D 对齐域插值、GS 是 3D 透视渲染，仍可能有残余错位。贴回前在 core 外的一圈（光流可靠）上把 GS 块配准到光流结果，再贴回；位移超过 20 px 视为不可信，退回直接贴回（`hyb_token`）。
+
+**本地（CPU）已在真实数据上跑过 token 检测**（`work/tokens/<setup>/cam{k}_overlay.png` 可直接看）：cam3 的 core 占前景 26–37%，集中在魔方、手、前臂和少量衣服边缘；cam5 为 7–22%，基线越大 token 越多。两个修正：RIFE 在 t=0/1 时融合掩码为 0/1，另一侧的光流不受监督（本应约 24 px，实际只有 7 px），不能用来做源图间的前后向检查，因此改用 DIS；深度阈值 0.5 会把脸、衣服轮廓全部标出（光流在这些地方其实是对的），改为 2.0。
+
+**第三轮更正**：用对齐图上真实匹配点的视差比例独立测得目标相机的 t，VGGT 与实测平均只差 0.011，棋盘格标定差 0.058。因此第三轮"cam3–cam4 间距只有一半"和"RIFE 的 t 对空间位置非线性"两条结论**撤回**：单块正对棋盘格下旋转与平移退化，标定的相机位置不可靠；RIFE 的 t 基本线性（oracle 与实测差 0.018），VGGT 的 t 是可靠的。标定脚本保留但默认不再使用。
+
+## 0.1 第三轮改动（相对第二轮实测）
 
 第二轮结论：cam3 物体区里，配准后的 GS 比最强光流（pose t + scale 0.5）高约 2.7 dB，LPIPS 也更低；但未配准时两者打平。GS 渲染与真值平均错位 8–10 px，说明 VGGT 估计的目标相机位姿和内参是主要瓶颈；滤波核影响不到 0.1 dB。第三轮针对这一点：
 
@@ -38,7 +70,7 @@
 
 5. **评估**：参考光流改为 `flow_s1.0_pose`（第二轮在两种基线下都优于均匀 t）；`+reg` 的 GS 也构造 `hyb_risk` / `hyb_risktuned` 混合，可以单独量化检测器的损失；配准 `ok` 只在确实接受了非恒等变换时计为成功（第二轮恒等回退也计入了）；关键对比表按位姿来源分别列出最好的 GS。
 
-## 0.1 第二轮改动（相对 2026-10-24 第一轮实测）
+## 0.2 第二轮改动（相对 2026-10-24 第一轮实测）
 
 第一轮结论：GS 在光流失败区只比光流高 0.15 dB，且 SSIM/LPIPS 更差；但拼图显示 GS 把魔方补对了，误差主要是**全图几个像素的错位**和 **448 渲染再放大 2.4 倍的模糊**（`rest` 区 GS 19.6 dB vs 光流 33.2 dB）。第二轮针对这两点：
 
@@ -111,19 +143,18 @@ HF_HUB_OFFLINE=1 PYTHONUNBUFFERED=1 bash run_all.sh configs/mofang_9cam.yaml
 python -m unittest discover -s tests -v
 ```
 
-**复用第二轮的工作目录**（推荐，`work/round2`）：`prepare` 和 uniform/pose/oracle 光流不变，只需标定、重跑 GS、补 `posecal` 光流和评估：
+**第四轮（推荐复用第二轮的工作目录 `work/round2`）**：`prepare`、uniform/pose/oracle 光流和 `poses/<setup>.json`（光流用的 t）都不变，只需检测 token、重跑 GS 和评估。必须复制 `poses/`，这样 `_int` 插值用的 t 与参考光流 `flow_s1.0_pose` 的 t 完全一致：
 
 ```bash
-export LGS_WORK_DIR=work/round3
+export LGS_WORK_DIR=work/round4
 mkdir -p $LGS_WORK_DIR && cp -r work/round2/{prepare,flow,poses,compat_packages} $LGS_WORK_DIR/
-python scripts/calibrate_rig.py --config configs/mofang_9cam.yaml     # CPU，约 10–20 分钟（BA）
+python scripts/detect_tokens.py --config configs/mofang_9cam.yaml     # GPU 上 1 分钟内
 python scripts/run_anysplat.py  --config configs/mofang_9cam.yaml
-python scripts/run_flow.py      --config configs/mofang_9cam.yaml --tmodes posecal
 python scripts/evaluate.py      --config configs/mofang_9cam.yaml
 python scripts/validate_results.py configs/mofang_9cam.yaml
 ```
 
-预计：AnySplat 2 个设置 × 2 个裁剪各编码 1 次，每次 2 种渲染 × 3 种位姿；evaluate 约 8 个光流 + 24 个 GS（含 `+reg`）+ 72 个混合，约 20–30 分钟（ECC 配准与 SSIM 在 CPU 上）。标定只需运行一次；`work/calib/rig.json` 里有完整的 K、畸变、c2w 和误差报告。
+预计：AnySplat 2 个设置 × 2 个裁剪（token、center）各编码 1 次；每次 2 种位姿（vggt、int）× 整窗口/局部共 4 次渲染。先看 `work/tokens/<setup>/cam{k}_overlay.png`（红 = 遮挡/匹配失败，黄 = 深度突变，蓝 = 重建区）确认 token 是否合理，再看 `summary.md` 开头的"Token 局部 GS 贴回"两张表。
 
 ### 各步骤输出（`work/`）
 
@@ -147,7 +178,21 @@ python scripts/validate_results.py configs/mofang_9cam.yaml
 2. `registration.csv`：`center448_in` 的平均位移就是第一轮"全图错位"的量化值；
 3. 拼图中黄色轮廓（object）应套住魔方和手。
 
-### 要回答的问题（第三轮）
+### 要回答的问题（第四轮，token 框架）
+
+对比基线：`flow_s1.0_pose`（与 `_int` 共用同一个 t）；cam3 另看 `flow_s0.5_pose`。
+
+| # | 问题 | 看哪里 | 支持框架的结果 |
+|---|---|---|---|
+| T1 | token 是否标在该标的地方 | `tokens/<setup>/cam{k}_overlay.png`、`tokens.json` | 集中在魔方、手、遮挡带；cam3 多于 cam5 |
+| T2 | 贴回区内局部 GS 是否优于光流 | "贴回区内"表：光流 vs `hyb_token` / `hyb_token_ringreg` | PSNR 更高且 LPIPS 更低 |
+| T3 | 整图是否变好 | "整图与物体区"表 `fg`、`object` 列 | fg 不降、object 明显提升 |
+| T4 | 统一位姿坐标系是否减少错位 | `*_int_local` vs `*_local`（无 `_int`），以及环带位移 | `_int` 更好、环带位移更小 |
+| T5 | 环带配准是否有用 | `hyb_token_ringreg` vs `hyb_token` | ringreg 更好 |
+| T6 | token 窗口 vs 整窗口 | `gs_token448_*_local` vs `gs_center448_*_local` | 相当或更好（只重建局部即可） |
+| T7 | 小基线 | cam5 | 贴回区小、收益小或为负，说明 GS 只应在大基线触发 |
+
+### 要回答的问题（第三轮，已完成）
 
 对比基线一律用**最强光流**：cam3 看 `flow_s0.5_pose`，cam5 看 `flow_s1.0_pose`（第二轮各自最好），不再用均匀 t。
 

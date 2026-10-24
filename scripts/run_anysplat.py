@@ -5,7 +5,9 @@ One encode per (setup, crop, input size); every render variant in `gs.renders` r
 Outputs per setup/variant (aligned image domain, comparable to RIFE results and GT):
   work/gs/<setup>/gs_<crop><size>_<render>/cam{k}.png, cam{k}_valid.png, cam{k}_alpha.png, meta.json
   work/gs/<setup>/gs_<crop><size>_poses.json
-The first (crop, size) also writes work/poses/<setup>.json, which run_flow.py uses for t_pose.
+work/poses/<setup>.json holds the t shared with run_flow.py; it is written by the first encode only if absent.
+With work/tokens/<setup> present (detect_tokens.py), each render also gets a *_local variant: only the
+Gaussians inside the token reconstruction region, plus cam{k}_alpha_core.png = footprint of the token core.
 """
 import argparse
 import sys
@@ -16,8 +18,8 @@ import cv2
 import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from lgs.anysplat_wrap import (AnySplatRunner, apply_sim3, distort_maps, paste_and_warp,  # noqa: E402
-                               rot_angle_deg, sim3_from_cams)
+from lgs.anysplat_wrap import (AnySplatRunner, apply_sim3, distort_maps, interp_pose, paste_and_warp,  # noqa: E402
+                               rot_angle_deg, sim3_from_cams, token_keep)
 from lgs.common import (bbox, cam_path, cube_mask, imread_rgb, imwrite, load_cfg, load_json, read_mask,  # noqa: E402
                         save_json, setup_cams, neighbors, write_mask)
 from lgs.compat import anysplat_source  # noqa: E402
@@ -31,7 +33,7 @@ def square_around(box, raw_shape, pad, min_side):
     return (int(np.clip(cx - side // 2, 0, w - side)), int(np.clip(cy - side // 2, 0, h - side)), side)
 
 
-def crop_window(mode, raw_shape, ctx_raws, fg_masks, gcfg, ck):
+def crop_window(mode, raw_shape, ctx_raws, fg_masks, gcfg, ck, token_masks=None, token_pad=0):
     h, w = raw_shape
     if mode == "center":
         side = min(h, w)
@@ -39,6 +41,10 @@ def crop_window(mode, raw_shape, ctx_raws, fg_masks, gcfg, ck):
     if mode == "fg":
         x0, y0, x1, y1 = bbox(np.logical_or.reduce(fg_masks))
         return square_around((x0, y0, x1, y1), raw_shape, int(0.03 * max(x1 - x0, y1 - y0)), 0)
+    if mode == "token":  # union of the context cameras' token reconstruction regions (core + margin)
+        if token_masks is None or not any(m.any() for m in token_masks):
+            raise RuntimeError("token 裁剪需要先运行 scripts/detect_tokens.py，且至少一台输入相机有标记")
+        return square_around(bbox(np.logical_or.reduce(token_masks)), raw_shape, token_pad, gcfg["roi_min_side"])
     if mode == "roi":
         if gcfg.get("roi_window"):
             return tuple(int(v) for v in gcfg["roi_window"])
@@ -49,7 +55,7 @@ def crop_window(mode, raw_shape, ctx_raws, fg_masks, gcfg, ck):
     raise ValueError(mode)
 
 
-POSE_SUFFIX = {"vggt": "", "calib": "_cal", "calibK": "_calK"}
+POSE_SUFFIX = {"vggt": "", "interp": "_int", "calib": "_cal", "calibK": "_calK"}
 
 
 def load_rig(work):
@@ -61,16 +67,28 @@ def load_rig(work):
             for k, v in cams.items()}
 
 
-def target_poses(state, ctx, targets, win, rig, sources):
+def target_poses(state, ctx, targets, win, rig, sources, t_by_target=None):
     """Target camera poses/intrinsics in the Gaussian frame for each requested pose source.
 
     vggt:   joint VGGT camera head (round 1-2).
+    interp: virtual camera interpolated between the two neighbouring context cameras in the Gaussian
+            frame at the same t the flow branch uses (one shared camera definition for both branches).
     calib:  offline rig calibration, mapped into the Gaussian frame by a Sim(3) fitted on the
             context cameras; intrinsics still from VGGT (consistent with how the Gaussians were built).
     calibK: as calib, plus calibrated focal/principal point and lens distortion.
     Returns {source: (c2w, intr_norm, use_distortion, diagnostics)}.
     """
     out = {"vggt": (state["tgt_c2w"], state["tgt_intr"], False, None)}
+    if "interp" in sources:
+        c2w, intr = [], []
+        for k in targets:
+            a, b = neighbors(ctx, k)
+            ia, ib = ctx.index(a), ctx.index(b)
+            p, kk = interp_pose(state["ctx_c2w"][ia], state["ctx_c2w"][ib], state["ctx_intr"][ia],
+                                state["ctx_intr"][ib], float(t_by_target[k]))
+            c2w.append(p)
+            intr.append(kk)
+        out["interp"] = (np.stack(c2w), np.stack(intr), False, None)
     if not ({"calib", "calibK"} & set(sources)):
         return {k: v for k, v in out.items() if k in sources}
     if rig is None:
@@ -129,15 +147,24 @@ def main():
     rig = load_rig(work)
     dmaps = {}
 
+    tcfg = cfg.get("tokens", {})
+
     for setup in args.setups or list(cfg["setups"]):
         ctx, targets = setup_cams(cfg, setup)
         raws = {k: imread_rgb(cam_path(cfg, "raw", k)) for k in ctx + targets}
         raw_shape = raws[ctx[0]].shape[:2]
         aligned_shape = imread_rgb(cam_path(cfg, "aligned", ctx[0])).shape[:2]
         fg_ctx = [read_mask(work / "prepare" / f"fg_raw_{k:02d}.png") for k in ctx]
-        first = True
+        tok_dir = work / "tokens" / setup
+        tokens = None
+        if tok_dir.exists():
+            tokens = {kind: [read_mask(tok_dir / f"cam{k}_{kind}_raw.png") for k in ctx] for kind in ("core", "recon")}
+        # Shared t with the flow branch: reuse the existing pose file (e.g. copied from round 2) if present.
+        pose_file = work / "poses" / f"{setup}.json"
+        shared_t = {int(k): v for k, v in load_json(pose_file)["t_pose"].items()} if pose_file.exists() else None
         for crop in crops:
-            win = crop_window(crop, raw_shape, [raws[k] for k in ctx], fg_ctx, gcfg, cfg["chroma"])
+            win = crop_window(crop, raw_shape, [raws[k] for k in ctx], fg_ctx, gcfg, cfg["chroma"],
+                              tokens["recon"] if tokens else None, tcfg.get("crop_pad_px", 0))
             x0, y0, side = win
             for size in sizes:
                 assert size % 14 == 0, "AnySplat/VGGT 需要 14 的倍数"
@@ -149,38 +176,6 @@ def main():
                 print(f"  gaussians={diag['num_gaussians']}  encode={diag['time_encode_s']:.3f}s  "
                       f"ctx self-PSNR={np.mean(diag['ctx_self_psnr']):.2f}dB  "
                       f"pose align rot err={max(diag['ctx_rot_err_deg']):.2f}deg")
-
-                poses_by_src = target_poses(state, ctx, targets, win, rig, gcfg["pose_sources"])
-                for src, (tgt_c2w, tgt_intr, use_dist, pdiag) in poses_by_src.items():
-                    if pdiag:
-                        print(f"  pose source {src}: ctx rot err after Sim3={max(pdiag['ctx_rot_err_deg']):.2f}deg "
-                              f"center err/baseline={max(pdiag['ctx_center_err_rel_baseline']):.3f}")
-                    for rv in gcfg["renders"]:
-                        res = size if rv["res"] == "input" else side
-                        eps2d = rv["eps2d"]
-                        if eps2d == "auto":  # keep the 0.3 px dilation of the input grid when rendering denser
-                            eps2d = 0.3 * (res / size) ** 2
-                        variant = f"{base}_{rv['name']}{POSE_SUFFIX[src]}"
-                        out = work / "gs" / setup / variant
-                        t0 = time.time()
-                        rgb, alpha = runner.render(state, tgt_c2w, tgt_intr, res, mode=rv["mode"], eps2d=eps2d,
-                                                   filter3d=rv["filter3d"], filter3d_var=gcfg["filter3d_var"],
-                                                   filter3d_comp=gcfg.get("filter3d_comp", False))
-                        t_render = (time.time() - t0) / len(targets)
-                        for i, k in enumerate(targets):
-                            dmap = dmaps.setdefault(k, distort_maps(rig[k]["K"], rig[k]["dist"], raw_shape)) \
-                                if use_dist else None
-                            img, a, valid = paste_and_warp(rgb[i], alpha[i], win, raw_shape, hs[k],
-                                                           aligned_shape, dmap)
-                            imwrite(out / f"cam{k}.png", img)
-                            imwrite(out / f"cam{k}_alpha.png", np.clip(a, 0, 1))
-                            write_mask(out / f"cam{k}_valid.png", valid)
-                        meta = dict(diag, window=list(win), size=size, crop=crop, render=rv, render_res=res,
-                                    eps2d_used=float(eps2d), time_render_per_view_s=t_render, pose_source=src,
-                                    pose_diag=pdiag)
-                        save_json(out / "meta.json", meta)
-                        print(f"  {variant}: res={res} mode={rv['mode']} eps2d={eps2d:.3f} "
-                              f"filter3d={rv['filter3d']} render/view={t_render * 1000:.1f}ms")
 
                 order = ctx + targets
                 c2w = {k: state["all_c2w_joint"][i] for i, k in enumerate(order)}
@@ -197,10 +192,66 @@ def main():
                     "c2w_joint": {k: c2w[k].tolist() for k in sorted(c2w)},
                 }
                 save_json(work / "gs" / setup / f"{base}_poses.json", poses)
-                if first:
-                    save_json(work / "poses" / f"{setup}.json", dict(poses, from_variant=base))
-                    first = False
-                print("  t_pose:", {k: round(v, 3) for k, v in t_pose.items()})
+                if shared_t is None:
+                    save_json(pose_file, dict(poses, from_variant=base))
+                    shared_t = t_pose
+                print("  t_pose (this encode):", {k: round(v, 3) for k, v in t_pose.items()},
+                      " t shared with flow:", {k: round(shared_t[k], 3) for k in targets})
+
+                keep = {}
+                if tokens:
+                    for kind in ("core", "recon"):
+                        masks = [cv2.resize(m[y0:y0 + side, x0:x0 + side].astype(np.uint8), (size, size),
+                                            interpolation=cv2.INTER_NEAREST) > 0 for m in tokens[kind]]
+                        keep[kind] = token_keep(state["gaussians"].means[0], state["ctx_c2w"], state["ctx_intr"], masks)
+                    diag["local_gaussians"] = {kind: int(v.sum()) for kind, v in keep.items()}
+                    print(f"  local GS: recon={diag['local_gaussians']['recon']} core={diag['local_gaussians']['core']}"
+                          f" of {diag['num_gaussians']} Gaussians")
+
+                poses_by_src = target_poses(state, ctx, targets, win, rig, gcfg["pose_sources"], shared_t)
+                for src, (tgt_c2w, tgt_intr, use_dist, pdiag) in poses_by_src.items():
+                    if pdiag:
+                        print(f"  pose source {src}: ctx rot err after Sim3={max(pdiag['ctx_rot_err_deg']):.2f}deg "
+                              f"center err/baseline={max(pdiag['ctx_center_err_rel_baseline']):.3f}")
+                    for rv in gcfg["renders"]:
+                        res = size if rv["res"] == "input" else side
+                        eps2d = rv["eps2d"]
+                        if eps2d == "auto":  # keep the 0.3 px dilation of the input grid when rendering denser
+                            eps2d = 0.3 * (res / size) ** 2
+                        kw = dict(mode=rv["mode"], eps2d=eps2d, filter3d=rv["filter3d"],
+                                  filter3d_var=gcfg["filter3d_var"], filter3d_comp=gcfg.get("filter3d_comp", False))
+                        name = f"{base}_{rv['name']}{POSE_SUFFIX[src]}"
+                        # full: all Gaussians of the crop; local: only the token reconstruction region
+                        outputs = {name: (None, None)}
+                        if keep:
+                            outputs[f"{name}_local"] = (keep["recon"], keep["core"])
+                        for variant, (kp, kp_core) in outputs.items():
+                            out = work / "gs" / setup / variant
+                            t0 = time.time()
+                            rgb, alpha = runner.render(state, tgt_c2w, tgt_intr, res, keep=kp, **kw)
+                            t_render = (time.time() - t0) / len(targets)
+                            alpha_core = None
+                            if kp_core is not None:
+                                alpha_core = runner.render(state, tgt_c2w, tgt_intr, res, keep=kp_core, **kw)[1]
+                            for i, k in enumerate(targets):
+                                dmap = None
+                                if use_dist:
+                                    dmap = dmaps.setdefault(k, distort_maps(rig[k]["K"], rig[k]["dist"], raw_shape))
+                                img, a, valid = paste_and_warp(rgb[i], alpha[i], win, raw_shape, hs[k],
+                                                               aligned_shape, dmap)
+                                imwrite(out / f"cam{k}.png", img)
+                                imwrite(out / f"cam{k}_alpha.png", np.clip(a, 0, 1))
+                                write_mask(out / f"cam{k}_valid.png", valid)
+                                if alpha_core is not None:
+                                    _, ac, _ = paste_and_warp(rgb[i], alpha_core[i], win, raw_shape, hs[k],
+                                                              aligned_shape, dmap)
+                                    imwrite(out / f"cam{k}_alpha_core.png", np.clip(ac, 0, 1))
+                            meta = dict(diag, window=list(win), size=size, crop=crop, render=rv, render_res=res,
+                                        eps2d_used=float(eps2d), time_render_per_view_s=t_render, pose_source=src,
+                                        pose_diag=pdiag, local=kp is not None)
+                            save_json(out / "meta.json", meta)
+                            print(f"  {variant}: res={res} mode={rv['mode']} eps2d={eps2d:.3f} "
+                                  f"filter3d={rv['filter3d']} render/view={t_render * 1000:.1f}ms")
                 del state
 
 

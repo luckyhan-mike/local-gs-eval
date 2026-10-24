@@ -8,7 +8,8 @@ import torch.nn.functional as F
 
 
 class RIFE:
-    def __init__(self, rife_dir, device="cuda"):
+    def __init__(self, rife_dir, device=None):
+        device = device or ("cuda" if torch.cuda.is_available() else "cpu")
         sys.path.insert(0, rife_dir)
         from train_log.IFNet_HDv3 import IFNet  # noqa: E402  (Practical-RIFE layout)
         from model.warplayer import warp        # noqa: E402

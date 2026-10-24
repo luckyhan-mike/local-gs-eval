@@ -35,9 +35,11 @@ def main():
     warnings = []
     for setup in cfg["setups"]:
         _, targets = setup_cams(cfg, setup)
-        suffix = {"vggt": "", "calib": "_cal", "calibK": "_calK"}
+        suffix = {"vggt": "", "interp": "_int", "calib": "_cal", "calibK": "_calK"}
         variants = [f"gs_{crop}{size}_{rv['name']}{suffix[src]}" for crop in gcfg["crops"] for size in gcfg["sizes"]
                     for rv in gcfg["renders"] for src in gcfg.get("pose_sources", ["vggt"])]
+        if (work / "tokens" / setup).exists():
+            variants += [v + "_local" for v in variants]
         for variant in variants:
             folder = work / "gs" / setup / variant
             meta = load_json(folder / "meta.json")
@@ -47,7 +49,7 @@ def main():
                 assert imread_rgb(folder / f"cam{k}.png").shape[2] == 3
                 counts["gs_renders"] += 1
         for scale in (1.0, 0.5):
-            for mode in ("uniform", "pose", "posecal", "oracle"):
+            for mode in ("uniform", "pose", "oracle"):
                 folder = work / "flow" / setup / f"flow_s{scale}_{mode}"
                 meta = load_json(folder / "meta.json")
                 assert set(meta) == {str(k) for k in targets}

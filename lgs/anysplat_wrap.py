@@ -153,16 +153,22 @@ class AnySplatRunner:
 
     @torch.no_grad()
     def render(self, state, c2w, intr_norm, res, mode="classic", eps2d=0.3, filter3d=False, filter3d_var=0.2,
-               filter3d_comp=False):
-        """Render views at res x res. Returns (V,res,res,3) colors, (V,res,res) alpha."""
+               filter3d_comp=False, keep=None):
+        """Render views at res x res (optionally only the Gaussians in boolean `keep`).
+
+        Returns (V,res,res,3) colors, (V,res,res) alpha."""
         g, dev = state["gaussians"], self.device
         means = g.means[0].float()
         cov = g.covariances[0].float()
         op = g.opacities[0].float().reshape(-1)
+        quats, scales = g.rotations[0].float(), g.scales[0].float()
+        feat = g.harmonics[0].permute(0, 2, 1).float().contiguous()  # N,K,3
+        if keep is not None:
+            keep = torch.as_tensor(keep, device=means.device)
+            means, cov, op, quats, scales, feat = (x[keep] for x in (means, cov, op, quats, scales, feat))
         if filter3d:
             cov, op, _ = mip_filter3d(means, cov, op, state["ctx_c2w"], state["ctx_intr"],
                                       state["size"], filter3d_var, filter3d_comp)
-        feat = g.harmonics[0].permute(0, 2, 1).float().contiguous()  # N,K,3
         sh_degree = int(round(np.sqrt(feat.shape[1]))) - 1
         bg = self.model.decoder.background_color.float().to(dev)[None]
         colors, alphas = [], []
@@ -172,12 +178,51 @@ class AnySplatRunner:
             k[0] *= res
             k[1] *= res
             rgb, alpha, _ = self.rasterization(
-                means, g.rotations[0].float(), g.scales[0].float(), op, feat, viewmat, k[None], res, res,
+                means, quats, scales, op, feat, viewmat, k[None], res, res,
                 sh_degree=sh_degree, render_mode="RGB", packed=False, near_plane=1e-10,
                 backgrounds=bg, radius_clip=0.1, covars=cov, rasterize_mode=mode, eps2d=float(eps2d))
             colors.append(rgb[0].clamp(0, 1).cpu().numpy())
             alphas.append(alpha[0, ..., 0].cpu().numpy())
         return np.stack(colors), np.stack(alphas)
+
+
+def token_keep(means, ctx_c2w, ctx_intr_norm, masks):
+    """Gaussians whose centre projects inside the token mask of at least one context camera.
+
+    masks: list of (S, S) bool arrays in each context camera's crop at the encoder resolution.
+    Every Gaussian along the rays through token pixels is kept (foreground in front and the
+    background behind it), which is the local scene volume needed to re-render that region.
+    """
+    means = torch.as_tensor(means)
+    keep = torch.zeros(len(means), dtype=torch.bool, device=means.device)
+    for c2w, intr, m in zip(ctx_c2w, ctx_intr_norm, masks):
+        s = m.shape[0]
+        w2c = torch.linalg.inv(torch.as_tensor(c2w, device=means.device, dtype=torch.float32))
+        k = torch.as_tensor(intr, device=means.device, dtype=torch.float32)
+        pc = means.float() @ w2c[:3, :3].T + w2c[:3, 3]
+        z = pc[:, 2].clamp(min=1e-6)
+        u = torch.round(k[0, 0] * s * pc[:, 0] / z + k[0, 2] * s).long()
+        v = torch.round(k[1, 1] * s * pc[:, 1] / z + k[1, 2] * s).long()
+        inside = (pc[:, 2] > 1e-3) & (u >= 0) & (u < s) & (v >= 0) & (v < s)
+        mt = torch.as_tensor(m, device=means.device)
+        hit = torch.zeros_like(keep)
+        hit[inside] = mt[v[inside], u[inside]]
+        keep |= hit
+    return keep
+
+
+def interp_pose(c2w_a, c2w_b, intr_a, intr_b, t):
+    """Virtual camera at t between two context cameras: slerp rotation, lerp centre and intrinsics.
+
+    This is the same parameterisation the flow branch uses (its t between the same two cameras),
+    so both branches describe one virtual camera instead of the GS branch using its own estimate.
+    """
+    from scipy.spatial.transform import Rotation, Slerp
+    rots = Rotation.from_matrix(np.stack([c2w_a[:3, :3], c2w_b[:3, :3]]))
+    out = np.eye(4)
+    out[:3, :3] = Slerp([0.0, 1.0], rots)([t]).as_matrix()[0]
+    out[:3, 3] = (1 - t) * c2w_a[:3, 3] + t * c2w_b[:3, 3]
+    return out, (1 - t) * np.asarray(intr_a) + t * np.asarray(intr_b)
 
 
 def distort_maps(K, dist, raw_shape):

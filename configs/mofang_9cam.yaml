@@ -23,7 +23,22 @@ chroma:                                 # 绿幕抠像（OpenCV HSV，H∈[0,180
   v_min: 30
   min_area_frac: 0.002
 
-calib:                                  # 离线阵列标定（scripts/calibrate_rig.py）
+tokens:                                 # 输入相机上的不可靠区域检测（scripts/detect_tokens.py，不使用真值）
+  rife_scale: 1.0
+  dis_preset: medium                    # 源图像之间的双向光流（OpenCV DIS）；RIFE 端点 t=0/1 的光流不可用
+  fb_thresh: 3.0                        # DIS 前后向不一致阈值（像素）= fb_thresh + fb_rel·|F|
+  fb_rel: 0.2
+  photo_thresh: 0.08                    # 光度残差（0~1，通道均值）；遮挡需同时满足前后向不一致与光度不一致
+  depth_thresh: 2.0                     # RIFE t=0.5 视差的水平梯度（像素/像素），沿 RIFE 对应关系映射回源图像；只取大的深度跳变（魔方 vs 头发），0.5 时脸/衣服轮廓全被标记
+  fg_dilate_px: 15                      # 只在前景附近标记
+  core_dilate_px: 6                     # token 核心区（贴回区）在原始标记外的膨胀
+  recon_margin_px: 48                   # 重建区 = 核心区再外扩，用于保证 GS 在 token 周围也重建准确
+  crop_pad_px: 32                       # token 裁剪窗口在重建区外接框外的边距
+  paste_feather_px: 8                   # 贴回羽化宽度（落在重建边距内，双方都可靠的区域）
+  ring_px: 24                           # 环带配准：在贴回区外这一圈用光流结果做参考（不用真值）
+  ring_max_disp_px: 20                  # 环带配准位移超过该值视为不可信，退回直接贴回
+
+calib:                                  # 离线阵列标定（第三轮负面结果：单块正对棋盘格下旋转-平移退化，t 误差 0.06；默认不使用）
   board_pattern: "北极星/biao_ding_9/grid_{:02d}.png"      # 同一阵列拍摄的棋盘格原图
   board_inner: [11, 8]                  # 内角点数（12x9 格）
   square_size: 1.0                      # 世界单位 = 1 格
@@ -35,17 +50,15 @@ calib:                                  # 离线阵列标定（scripts/calibrate
 
 gs:
   sizes: [448]                          # AnySplat 训练分辨率；上一轮 518 的输入视点自渲染明显退化
-  crops: [center, roi]                  # center: 中心 1080x1080；roi: 输入相机中魔方外接框+边距；fg: 人物外接框
+  crops: [token, center]                # token: 输入相机 token 重建区外接框（第四轮主设置）；center: 中心 1080x1080（整窗口对照）；roi/fg 保留可选
   roi_pad_px: 80                        # ROI 在魔方外接框四周的边距（覆盖手和遮挡带）
   roi_min_side: 448                     # ROI 最小边长（不小于输入分辨率，避免下采样以外的放大）
   roi_window: null                      # 手动指定 [x0, y0, side] 可跳过自动检测
   filter3d_var: 0.2                     # Mip-Splatting 3D 平滑滤波方差系数 s（σ² = s·(d/f)²）
   filter3d_comp: false                  # 3D 滤波的不透明度能量补偿；AnySplat 的扁平高斯会被压成透明（第二轮），默认关闭
-  pose_sources: [vggt, calib, calibK]   # 目标相机位姿：VGGT 联合估计 / 标定位姿+VGGT 内参 / 标定位姿+标定内参与畸变
-  renders:                              # 每个 (crop, size) 只编码一次，下列渲染方式复用同一组高斯
-    # 第二轮 in / nat / nat_dil / nat_mip2d 相差 <0.1 dB，本轮只保留 nat_dil 与修正后的 nat_mip
-    - {name: nat_dil,   res: native, mode: classic,     eps2d: auto, filter3d: false}  # 膨胀按分辨率比例放大：0.3·(res/size)²
-    - {name: nat_mip,   res: native, mode: antialiased, eps2d: 0.1,  filter3d: true}   # Mip-Splatting 3D 平滑(无补偿) + 2D Mip
+  pose_sources: [vggt, interp]          # vggt: 联合估计的目标位姿；interp: 在高斯坐标系内按光流同一个 t 插值两侧输入相机（统一相机定义）。calib/calibK 为第三轮负面结果
+  renders:                              # 每个 (crop, size) 只编码一次；第二、三轮滤波核差异 <0.1 dB，只保留 nat_dil
+    - {name: nat_dil,   res: native, mode: classic,     eps2d: auto, filter3d: false}  # 原生分辨率渲染，膨胀按分辨率比例放大
 
 risk:                                   # 光流自身信号 → 风险区域（不使用真值）
   warp_thresh: 0.08                     # |W0-W1| 通道均值阈值（0~1）
