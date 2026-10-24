@@ -37,6 +37,7 @@ tokens:                                 # 输入相机上的不可靠区域检�
   paste_feather_px: 8                   # 贴回羽化宽度（落在重建边距内，双方都可靠的区域）
   ring_px: 24                           # 环带配准：在贴回区外这一圈用光流结果做参考（不用真值）
   ring_max_disp_px: 20                  # 环带配准位移超过该值视为不可信，退回直接贴回
+  paste_fg_dilate_px: 15                # 贴回只在光流结果前景（绿幕抠像）附近进行，不用真值
 
 calib:                                  # 离线阵列标定（第三轮负面结果：单块正对棋盘格下旋转-平移退化，t 误差 0.06；默认不使用）
   board_pattern: "北极星/biao_ding_9/grid_{:02d}.png"      # 同一阵列拍摄的棋盘格原图
@@ -56,7 +57,11 @@ gs:
   roi_window: null                      # 手动指定 [x0, y0, side] 可跳过自动检测
   filter3d_var: 0.2                     # Mip-Splatting 3D 平滑滤波方差系数 s（σ² = s·(d/f)²）
   filter3d_comp: false                  # 3D 滤波的不透明度能量补偿；AnySplat 的扁平高斯会被压成透明（第二轮），默认关闭
-  pose_sources: [vggt, interp]          # vggt: 联合估计的目标位姿；interp: 在高斯坐标系内按光流同一个 t 插值两侧输入相机（统一相机定义）。calib/calibK 为第三轮负面结果
+  pose_sources: [vggt, aligned_int, aligned_vggt]   # vggt: 目标相机原图域渲染再经 H_k（对照）；aligned_*: 直接在对齐（离轴）域渲染，int=光心按光流同一 t 插值，vggt=光心取 VGGT 估计。interp（第四轮，朝向插值）失败已弃用
+  aligned_ref: 4                        # 对齐参考相机（单应 H 近似相似变换的那台，即中心相机）
+  aligned_pad_px: 160                   # 对齐域渲染画布四周的余量（平面单应会平移画面）
+  keep_mode: visible                    # 局部高斯：visible=输入相机中深度测试后的可见表面；ray=视线穿过即保留（第四轮，足迹过大）
+  visible_tol: 0.03                     # 可见性深度容差（相对）
   renders:                              # 每个 (crop, size) 只编码一次；第二、三轮滤波核差异 <0.1 dB，只保留 nat_dil
     - {name: nat_dil,   res: native, mode: classic,     eps2d: auto, filter3d: false}  # 原生分辨率渲染，膨胀按分辨率比例放大
 

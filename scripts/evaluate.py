@@ -248,6 +248,7 @@ def main():
                 if gs_meta[gv].get("local"):
                     # Token paste-back: the region is where the token core projects into this view.
                     core = (read_alpha(gs_dir / gv / f"cam{k}_alpha_core.png") > 0.5) & v
+                    core &= dilate(chroma_fg(preds[ref], ck), tcfg.get("paste_fg_dilate_px", 15))  # GT-free
                     paste[gv] = core
                     tok_w = paste_weight(core, ok, tcfg["paste_feather_px"])
                     preds[f"hyb_token[{gv}]"] = blend_w(preds[ref], p, tok_w)

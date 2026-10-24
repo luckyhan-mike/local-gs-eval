@@ -154,9 +154,19 @@ class AnySplatRunner:
     @torch.no_grad()
     def render(self, state, c2w, intr_norm, res, mode="classic", eps2d=0.3, filter3d=False, filter3d_var=0.2,
                filter3d_comp=False, keep=None):
-        """Render views at res x res (optionally only the Gaussians in boolean `keep`).
+        """Render views at res x res from crop-normalised intrinsics (optionally only `keep`).
 
         Returns (V,res,res,3) colors, (V,res,res) alpha."""
+        K = np.array(intr_norm, np.float64).copy()
+        K[:, 0] *= res
+        K[:, 1] *= res
+        return self.render_px(state, c2w, K, res, res, mode=mode, eps2d=eps2d, filter3d=filter3d,
+                              filter3d_var=filter3d_var, filter3d_comp=filter3d_comp, keep=keep)[:2]
+
+    @torch.no_grad()
+    def render_px(self, state, c2w, K_px, width, height, mode="classic", eps2d=0.3, filter3d=False,
+                  filter3d_var=0.2, filter3d_comp=False, keep=None, depth=False):
+        """Render width x height views from pixel intrinsics. Returns colors, alpha, expected depth."""
         g, dev = state["gaussians"], self.device
         means = g.means[0].float()
         cov = g.covariances[0].float()
@@ -171,19 +181,53 @@ class AnySplatRunner:
                                       state["size"], filter3d_var, filter3d_comp)
         sh_degree = int(round(np.sqrt(feat.shape[1]))) - 1
         bg = self.model.decoder.background_color.float().to(dev)[None]
-        colors, alphas = [], []
+        colors, alphas, depths = [], [], []
         for j in range(len(c2w)):
             viewmat = torch.linalg.inv(torch.as_tensor(c2w[j], dtype=torch.float32, device=dev))[None]
-            k = torch.as_tensor(intr_norm[j], dtype=torch.float32, device=dev).clone()
-            k[0] *= res
-            k[1] *= res
-            rgb, alpha, _ = self.rasterization(
-                means, quats, scales, op, feat, viewmat, k[None], res, res,
-                sh_degree=sh_degree, render_mode="RGB", packed=False, near_plane=1e-10,
-                backgrounds=bg, radius_clip=0.1, covars=cov, rasterize_mode=mode, eps2d=float(eps2d))
-            colors.append(rgb[0].clamp(0, 1).cpu().numpy())
+            k = torch.as_tensor(K_px[j], dtype=torch.float32, device=dev)
+            out, alpha, _ = self.rasterization(
+                means, quats, scales, op, feat, viewmat, k[None], int(width), int(height),
+                sh_degree=sh_degree, render_mode="RGB+ED" if depth else "RGB", packed=False, near_plane=1e-10,
+                backgrounds=torch.cat([bg, bg.new_zeros(1, 1)], 1) if depth else bg,
+                radius_clip=0.1, covars=cov, rasterize_mode=mode, eps2d=float(eps2d))
+            colors.append(out[0, ..., :3].clamp(0, 1).cpu().numpy())
             alphas.append(alpha[0, ..., 0].cpu().numpy())
-        return np.stack(colors), np.stack(alphas)
+            if depth:
+                depths.append(out[0, ..., 3].cpu().numpy())
+        return np.stack(colors), np.stack(alphas), (np.stack(depths) if depth else None)
+
+    @torch.no_grad()
+    def visible_keep(self, state, masks, tol=0.03):
+        """Gaussians on the visible surface inside each context camera's token mask (depth-tested).
+
+        A Gaussian is kept if its centre projects into the mask of some context camera and lies within
+        `tol` (relative) of that camera's rendered expected depth there, i.e. it is the surface the
+        camera actually sees. Occluded background needed by a virtual view is the visible surface of
+        the other context camera's token region, so it is still kept; large background splats behind
+        the token, which inflated the round-4 paste footprint, are not.
+        """
+        size = state["size"]
+        K = np.array(state["ctx_intr"], np.float64).copy()
+        K[:, 0] *= size
+        K[:, 1] *= size
+        _, _, depth = self.render_px(state, state["ctx_c2w"], K, size, size, depth=True)
+        means = state["gaussians"].means[0].float()
+        keep = torch.zeros(len(means), dtype=torch.bool, device=means.device)
+        for c2w, k, m, dmap in zip(state["ctx_c2w"], K, masks, depth):
+            w2c = torch.linalg.inv(torch.as_tensor(c2w, device=means.device, dtype=torch.float32))
+            kk = torch.as_tensor(k, device=means.device, dtype=torch.float32)
+            pc = means @ w2c[:3, :3].T + w2c[:3, 3]
+            z = pc[:, 2]
+            u = torch.round(kk[0, 0] * pc[:, 0] / z.clamp(min=1e-6) + kk[0, 2]).long()
+            v = torch.round(kk[1, 1] * pc[:, 1] / z.clamp(min=1e-6) + kk[1, 2]).long()
+            inside = (z > 1e-3) & (u >= 0) & (u < size) & (v >= 0) & (v < size)
+            mt = torch.as_tensor(m, device=means.device)
+            dt = torch.as_tensor(dmap, device=means.device, dtype=torch.float32)
+            hit = torch.zeros_like(keep)
+            iu, iv = u[inside], v[inside]
+            hit[inside] = mt[iv, iu] & (z[inside] <= dt[iv, iu] * (1 + tol))
+            keep |= hit
+        return keep
 
 
 def token_keep(means, ctx_c2w, ctx_intr_norm, masks):

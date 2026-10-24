@@ -14,7 +14,22 @@
 
 ---
 
-## 0. 第四轮：按原始框架做 token 局部 GS（当前主实验）
+## 0. 第五轮：在对齐（离轴）域渲染 GS，贴回足迹改为可见表面（当前主实验）
+
+第四轮 token 贴回能把魔方补对，但整体变差，原因有两个，第五轮分别修正：
+
+1. **统一坐标系 = 光流的对齐域。** 第四轮 `_int` 在两侧输入相机之间插值朝向，但本阵列每台相机是单独对准的，插值朝向与真实目标相机差 0.6–2.5°（f≈1820 px 时 20–80 px），再用真实相机的 H_k 贴回就整体错位。光流其实一直在一个统一坐标系里工作：单应对齐后的图像域，各相机各自的朝向已被消掉，只剩光心位置带来的视差，正是光场显示的**离轴相机**。第五轮让 GS 直接在这个域渲染（`lgs/aligned.py`，位姿来源 `aligned_int` / `aligned_vggt`，后缀 `_al` / `_alv`）：
+   - 对齐参考相机：`H_ref · K_ref = K_al · Q`（RQ 分解），得到对齐域内参 `K_al` 和朝向；
+   - 零视差平面：只用输入相机的 GS 位姿/内参和它们已知的单应 H，在高斯坐标系里拟合平面（`plane_rms_px` 是拟合残差，同时反映 AnySplat 输入相机几何与真实 H 的一致程度）；
+   - 虚拟视点：参考朝向 + 对齐内参，放在目标光心 C 处渲染，再乘零视差平面单应 G_C。
+
+   **依据**：同一光心的两台相机之间对所有点都只差一个单应，所以这样渲染出的图与"任意朝向、任意内参的真实相机在 C 处拍摄、再用它自己的 H 对齐"**完全相同**（不只是平面上的点）。真实相机的朝向和内参因此不再影响结果，只剩光心位置和高斯几何本身。单元测试在合成会聚阵列上验证了这一点（离平面的点误差 <1.5 px，独立数值检验 1e-5 px）。
+   - `aligned_int`：光心在两侧输入相机光心间按光流同一个 t 插值（部署时生成虚拟视点就是这样）；
+   - `aligned_vggt`：光心取 VGGT 联合估计（与真实目标相机对照，区分"光心位置误差"和"高斯几何误差"）。
+
+2. **贴回足迹 = 输入相机里可见的表面。** 第四轮保留了视线穿过 token 的所有高斯，魔方后面的头发、绿幕上的大高斯也进来了，投影到虚拟视点后足迹约占前景的 61%，还有 40% 在前景外，把可靠的光流也换掉了（rest 从 33.5 dB 掉到 21.9 dB）。第五轮改为：渲染每台输入相机的期望深度，只保留投影落在 token 区域内、且深度通过测试（≤ 渲染深度×1.03）的高斯（`gs.keep_mode: visible`）。遮挡区要补的背景正是另一台输入相机 token 区域里的可见表面，所以不会丢。贴回区还会限制在光流结果前景（抠像）外扩 15 px 内（不用真值）。
+
+## 0.1 第四轮：按原始框架做 token 局部 GS
 
 前三轮的不可靠区域都定义在**虚拟视点（目标图）**上，GS 也是对整个裁剪窗口重建，这和原始框架不一致。第四轮改为：
 
@@ -46,7 +61,7 @@ run_anysplat.py：窗口 = 各输入相机重建区外接框；AnySplat 编码�
 
 **第三轮更正**：用对齐图上真实匹配点的视差比例独立测得目标相机的 t，VGGT 与实测平均只差 0.011，棋盘格标定差 0.058。因此第三轮"cam3–cam4 间距只有一半"和"RIFE 的 t 对空间位置非线性"两条结论**撤回**：单块正对棋盘格下旋转与平移退化，标定的相机位置不可靠；RIFE 的 t 基本线性（oracle 与实测差 0.018），VGGT 的 t 是可靠的。标定脚本保留但默认不再使用。
 
-## 0.1 第三轮改动（相对第二轮实测）
+## 0.2 第三轮改动（相对第二轮实测）
 
 第二轮结论：cam3 物体区里，配准后的 GS 比最强光流（pose t + scale 0.5）高约 2.7 dB，LPIPS 也更低；但未配准时两者打平。GS 渲染与真值平均错位 8–10 px，说明 VGGT 估计的目标相机位姿和内参是主要瓶颈；滤波核影响不到 0.1 dB。第三轮针对这一点：
 
@@ -70,7 +85,7 @@ run_anysplat.py：窗口 = 各输入相机重建区外接框；AnySplat 编码�
 
 5. **评估**：参考光流改为 `flow_s1.0_pose`（第二轮在两种基线下都优于均匀 t）；`+reg` 的 GS 也构造 `hyb_risk` / `hyb_risktuned` 混合，可以单独量化检测器的损失；配准 `ok` 只在确实接受了非恒等变换时计为成功（第二轮恒等回退也计入了）；关键对比表按位姿来源分别列出最好的 GS。
 
-## 0.2 第二轮改动（相对 2026-10-24 第一轮实测）
+## 0.3 第二轮改动（相对 2026-10-24 第一轮实测）
 
 第一轮结论：GS 在光流失败区只比光流高 0.15 dB，且 SSIM/LPIPS 更差；但拼图显示 GS 把魔方补对了，误差主要是**全图几个像素的错位**和 **448 渲染再放大 2.4 倍的模糊**（`rest` 区 GS 19.6 dB vs 光流 33.2 dB）。第二轮针对这两点：
 
@@ -143,6 +158,19 @@ HF_HUB_OFFLINE=1 PYTHONUNBUFFERED=1 bash run_all.sh configs/mofang_9cam.yaml
 python -m unittest discover -s tests -v
 ```
 
+**第五轮（复用第四轮的工作目录）**：`prepare`、光流、`poses/`、`tokens/` 都不变，只需重跑 GS 和评估：
+
+```bash
+export LGS_WORK_DIR=work/round5
+mkdir -p $LGS_WORK_DIR && cp -r work/round4/{prepare,flow,poses,tokens,compat_packages} $LGS_WORK_DIR/
+python scripts/run_anysplat.py  --config configs/mofang_9cam.yaml
+python scripts/evaluate.py      --config configs/mofang_9cam.yaml
+python scripts/validate_results.py configs/mofang_9cam.yaml
+python -m unittest discover -s tests -v
+```
+
+日志里每次编码会打印 `zero-parallax plane fit rms`（越小说明 AnySplat 的输入相机几何与真实单应越一致）和局部高斯数量（visible 模式应明显少于第四轮）。
+
 **第四轮（推荐复用第二轮的工作目录 `work/round2`）**：`prepare`、uniform/pose/oracle 光流和 `poses/<setup>.json`（光流用的 t）都不变，只需检测 token、重跑 GS 和评估。必须复制 `poses/`，这样 `_int` 插值用的 t 与参考光流 `flow_s1.0_pose` 的 t 完全一致：
 
 ```bash
@@ -177,6 +205,16 @@ python scripts/validate_results.py configs/mofang_9cam.yaml
 1. AnySplat 统计表中 `in` 变体的输入视点自渲染 PSNR 应与第一轮一致（center448 约 29 dB）；
 2. `registration.csv`：`center448_in` 的平均位移就是第一轮"全图错位"的量化值；
 3. 拼图中黄色轮廓（object）应套住魔方和手。
+
+### 要回答的问题（第五轮）
+
+| # | 问题 | 看哪里 | 支持框架的结果 |
+|---|---|---|---|
+| A1 | 对齐域渲染是否消除错位 | 环带位移（`token_ringreg.csv`）与 `+reg` 位移：`_al` / `_alv` vs 无后缀 | 明显小于第四轮（cam3 约 8–11 px） |
+| A2 | 贴回足迹是否收紧 | 贴回区占前景比例；`rest` 区 PSNR | 足迹远小于第四轮的 61%，rest 接近纯光流（≈33.5 dB） |
+| A3 | 整图是否超过纯光流 | "整图与物体区"表：`hyb_token*[*_al_local]` vs `flow_s1.0_pose` | fg 不降且 object 提升 |
+| A4 | 光心插值是否够用 | `_al` vs `_alv` | 接近，说明部署时按 t 插值光心即可 |
+| A5 | 零视差平面拟合质量 | 日志 `plane fit rms` | 小（几 px 以内）；若很大，AnySplat 输入相机几何本身与真实阵列不一致 |
 
 ### 要回答的问题（第四轮，token 框架）
 

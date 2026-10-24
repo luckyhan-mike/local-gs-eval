@@ -22,6 +22,7 @@ from lgs.anysplat_wrap import (AnySplatRunner, apply_sim3, distort_maps, interp_
                                rot_angle_deg, sim3_from_cams, token_keep)
 from lgs.common import (bbox, cam_path, cube_mask, imread_rgb, imwrite, load_cfg, load_json, read_mask,  # noqa: E402
                         save_json, setup_cams, neighbors, write_mask)
+from lgs.aligned import aligned_reference, crop_K_to_raw, fit_plane, plane_homography  # noqa: E402
 from lgs.compat import anysplat_source  # noqa: E402
 
 
@@ -55,7 +56,7 @@ def crop_window(mode, raw_shape, ctx_raws, fg_masks, gcfg, ck, token_masks=None,
     raise ValueError(mode)
 
 
-POSE_SUFFIX = {"vggt": "", "interp": "_int", "calib": "_cal", "calibK": "_calK"}
+POSE_SUFFIX = {"vggt": "", "interp": "_int", "aligned_int": "_al", "aligned_vggt": "_alv", "calib": "_cal", "calibK": "_calK"}
 
 
 def load_rig(work):
@@ -111,6 +112,65 @@ def target_poses(state, ctx, targets, win, rig, sources, t_by_target=None):
                               [0, K[1, 1] / side, (K[1, 2] - y0) / side], [0, 0, 1]]))
     out["calibK"] = (tgt, np.stack(intr), True, pdiag)
     return {k: v for k, v in out.items() if k in sources}
+
+
+def aligned_setup(runner, state, ctx, targets, win, hs, gcfg, shared_t, aligned_shape):
+    """Aligned-domain reference camera, zero-parallax plane and target centres in the Gaussian frame.
+
+    Uses only the context cameras (their AnySplat poses/intrinsics and their known homographies H).
+    Target centres: aligned_int = interpolated between the neighbouring context centres at the flow's t;
+    aligned_vggt = the joint VGGT estimate of the target centre (mapped into the Gaussian frame).
+    """
+    ref = gcfg["aligned_ref"]
+    if ref not in ctx:
+        raise RuntimeError(f"aligned_ref={ref} 必须是输入相机之一（对齐参考相机）")
+    K_raw = [crop_K_to_raw(k, win) for k in state["ctx_intr"]]
+    ir = ctx.index(ref)
+    K_al, c2w_al = aligned_reference(K_raw[ir], state["ctx_c2w"][ir], hs[ref])
+    # rough plane distance from the reference camera's rendered depth (initialisation only)
+    size = state["size"]
+    Ks = np.array(state["ctx_intr"][ir], np.float64).copy()
+    Ks[0] *= size
+    Ks[1] *= size
+    _, a, dep = runner.render_px(state, state["ctx_c2w"][ir:ir + 1], Ks[None], size, size, depth=True)
+    depth0 = float(np.median(dep[0][a[0] > 0.5])) if (a[0] > 0.5).any() else 1.0
+    x0, y0, side = win
+    grid = np.stack(np.meshgrid(np.linspace(x0 + 0.1 * side, x0 + 0.9 * side, 9),
+                                np.linspace(y0 + 0.1 * side, y0 + 0.9 * side, 9)), -1).reshape(-1, 2)
+    cams = [(K_raw[i], state["ctx_c2w"][i], hs[c], grid) for i, c in enumerate(ctx) if c != ref]
+    n, d, rms = fit_plane(cams, K_al, c2w_al, depth0)
+    centers = {"aligned_int": [], "aligned_vggt": []}
+    for i, k in enumerate(targets):
+        a_, b_ = neighbors(ctx, k)
+        t = float(shared_t[k])
+        ca, cb = state["ctx_c2w"][ctx.index(a_)][:3, 3], state["ctx_c2w"][ctx.index(b_)][:3, 3]
+        centers["aligned_int"].append((1 - t) * ca + t * cb)
+        centers["aligned_vggt"].append(state["tgt_c2w"][i][:3, 3])
+    return {"ref": ref, "K_al": K_al, "c2w_al": c2w_al, "n": n, "d": d, "plane_rms_px": rms,
+            "centers": centers, "shape": aligned_shape, "pad": int(gcfg.get("aligned_pad_px", 160))}
+
+
+def render_aligned(runner, state, al, src, keep, kw):
+    """Off-axis views in the flow (aligned) domain: reference rotation/intrinsics at each target
+    centre, then the zero-parallax-plane homography. Returns [(rgb, alpha, valid)] per target."""
+    h, w = al["shape"]
+    p = al["pad"]
+    K = al["K_al"].copy()
+    K[0, 2] += p
+    K[1, 2] += p
+    shift = np.array([[1, 0, -p], [0, 1, -p], [0, 0, 1.0]])
+    out = []
+    for c in al["centers"][src]:
+        cam = al["c2w_al"].copy()
+        cam[:3, 3] = c
+        rgb, alpha, _ = runner.render_px(state, cam[None], K[None], w + 2 * p, h + 2 * p, keep=keep, **kw)
+        G = plane_homography(al["K_al"], al["c2w_al"], c, al["n"], al["d"], (w, h)) @ shift
+        img = cv2.warpPerspective(rgb[0], G, (w, h), flags=cv2.INTER_LINEAR)
+        a = cv2.warpPerspective(alpha[0], G, (w, h), flags=cv2.INTER_LINEAR)
+        valid = cv2.warpPerspective(np.ones((h + 2 * p, w + 2 * p), np.uint8), G, (w, h),
+                                    flags=cv2.INTER_NEAREST) > 0
+        out.append((np.clip(img, 0, 1), a, valid))
+    return out
 
 
 def rig_positions(c2w_by_cam, ctx):
@@ -203,21 +263,41 @@ def main():
                     for kind in ("core", "recon"):
                         masks = [cv2.resize(m[y0:y0 + side, x0:x0 + side].astype(np.uint8), (size, size),
                                             interpolation=cv2.INTER_NEAREST) > 0 for m in tokens[kind]]
-                        keep[kind] = token_keep(state["gaussians"].means[0], state["ctx_c2w"], state["ctx_intr"], masks)
+                        if gcfg.get("keep_mode", "visible") == "visible":
+                            keep[kind] = runner.visible_keep(state, masks, gcfg.get("visible_tol", 0.03))
+                        else:
+                            keep[kind] = token_keep(state["gaussians"].means[0], state["ctx_c2w"],
+                                                    state["ctx_intr"], masks)
                     diag["local_gaussians"] = {kind: int(v.sum()) for kind, v in keep.items()}
-                    print(f"  local GS: recon={diag['local_gaussians']['recon']} core={diag['local_gaussians']['core']}"
-                          f" of {diag['num_gaussians']} Gaussians")
+                    print(f"  local GS ({gcfg.get('keep_mode', 'visible')}): recon={diag['local_gaussians']['recon']}"
+                          f" core={diag['local_gaussians']['core']} of {diag['num_gaussians']} Gaussians")
 
-                poses_by_src = target_poses(state, ctx, targets, win, rig, gcfg["pose_sources"], shared_t)
+                # Camera-domain sources render the raw target view and warp it with that camera's H.
+                sources = [s for s in gcfg["pose_sources"] if not s.startswith("aligned")]
+                poses_by_src = target_poses(state, ctx, targets, win, rig, sources, shared_t)
+                # Aligned-domain sources render the off-axis view at a centre directly in the flow domain.
+                al = None
+                if any(s.startswith("aligned") for s in gcfg["pose_sources"]):
+                    al = aligned_setup(runner, state, ctx, targets, win, hs, gcfg, shared_t, aligned_shape)
+                    print(f"  aligned domain: ref cam {al['ref']}, zero-parallax plane fit rms={al['plane_rms_px']:.3f}px")
+                    for s in gcfg["pose_sources"]:
+                        if s.startswith("aligned"):
+                            poses_by_src[s] = (None, None, False, {"plane_rms_px": al["plane_rms_px"]})
+
                 for src, (tgt_c2w, tgt_intr, use_dist, pdiag) in poses_by_src.items():
-                    if pdiag:
+                    if pdiag and "ctx_rot_err_deg" in pdiag:
                         print(f"  pose source {src}: ctx rot err after Sim3={max(pdiag['ctx_rot_err_deg']):.2f}deg "
                               f"center err/baseline={max(pdiag['ctx_center_err_rel_baseline']):.3f}")
                     for rv in gcfg["renders"]:
-                        res = size if rv["res"] == "input" else side
+                        if src.startswith("aligned"):
+                            res = None
+                            scale = al["K_al"][0, 0] / (state["ctx_intr"][ctx.index(al["ref"])][0, 0] * size)
+                        else:
+                            res = size if rv["res"] == "input" else side
+                            scale = res / size
                         eps2d = rv["eps2d"]
                         if eps2d == "auto":  # keep the 0.3 px dilation of the input grid when rendering denser
-                            eps2d = 0.3 * (res / size) ** 2
+                            eps2d = 0.3 * scale ** 2
                         kw = dict(mode=rv["mode"], eps2d=eps2d, filter3d=rv["filter3d"],
                                   filter3d_var=gcfg["filter3d_var"], filter3d_comp=gcfg.get("filter3d_comp", False))
                         name = f"{base}_{rv['name']}{POSE_SUFFIX[src]}"
@@ -228,29 +308,38 @@ def main():
                         for variant, (kp, kp_core) in outputs.items():
                             out = work / "gs" / setup / variant
                             t0 = time.time()
-                            rgb, alpha = runner.render(state, tgt_c2w, tgt_intr, res, keep=kp, **kw)
+                            if src.startswith("aligned"):
+                                views = render_aligned(runner, state, al, src, kp, kw)
+                                cores = render_aligned(runner, state, al, src, kp_core, kw) if kp_core is not None \
+                                    else None
+                            else:
+                                rgb, alpha = runner.render(state, tgt_c2w, tgt_intr, res, keep=kp, **kw)
+                                acore = runner.render(state, tgt_c2w, tgt_intr, res, keep=kp_core, **kw)[1] \
+                                    if kp_core is not None else None
+                                views = []
+                                cores = [] if acore is not None else None
+                                for i, k in enumerate(targets):
+                                    dmap = None
+                                    if use_dist:
+                                        dmap = dmaps.setdefault(k, distort_maps(rig[k]["K"], rig[k]["dist"], raw_shape))
+                                    views.append(paste_and_warp(rgb[i], alpha[i], win, raw_shape, hs[k],
+                                                                aligned_shape, dmap))
+                                    if acore is not None:
+                                        cores.append(paste_and_warp(rgb[i], acore[i], win, raw_shape, hs[k],
+                                                                    aligned_shape, dmap))
                             t_render = (time.time() - t0) / len(targets)
-                            alpha_core = None
-                            if kp_core is not None:
-                                alpha_core = runner.render(state, tgt_c2w, tgt_intr, res, keep=kp_core, **kw)[1]
                             for i, k in enumerate(targets):
-                                dmap = None
-                                if use_dist:
-                                    dmap = dmaps.setdefault(k, distort_maps(rig[k]["K"], rig[k]["dist"], raw_shape))
-                                img, a, valid = paste_and_warp(rgb[i], alpha[i], win, raw_shape, hs[k],
-                                                               aligned_shape, dmap)
+                                img, a, valid = views[i]
                                 imwrite(out / f"cam{k}.png", img)
                                 imwrite(out / f"cam{k}_alpha.png", np.clip(a, 0, 1))
                                 write_mask(out / f"cam{k}_valid.png", valid)
-                                if alpha_core is not None:
-                                    _, ac, _ = paste_and_warp(rgb[i], alpha_core[i], win, raw_shape, hs[k],
-                                                              aligned_shape, dmap)
-                                    imwrite(out / f"cam{k}_alpha_core.png", np.clip(ac, 0, 1))
+                                if cores is not None:
+                                    imwrite(out / f"cam{k}_alpha_core.png", np.clip(cores[i][1], 0, 1))
                             meta = dict(diag, window=list(win), size=size, crop=crop, render=rv, render_res=res,
                                         eps2d_used=float(eps2d), time_render_per_view_s=t_render, pose_source=src,
                                         pose_diag=pdiag, local=kp is not None)
                             save_json(out / "meta.json", meta)
-                            print(f"  {variant}: res={res} mode={rv['mode']} eps2d={eps2d:.3f} "
+                            print(f"  {variant}: res={res or 'aligned'} mode={rv['mode']} eps2d={eps2d:.3f} "
                                   f"filter3d={rv['filter3d']} render/view={t_render * 1000:.1f}ms")
                 del state
 

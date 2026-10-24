@@ -35,7 +35,7 @@ def main():
     warnings = []
     for setup in cfg["setups"]:
         _, targets = setup_cams(cfg, setup)
-        suffix = {"vggt": "", "interp": "_int", "calib": "_cal", "calibK": "_calK"}
+        suffix = {"vggt": "", "interp": "_int", "aligned_int": "_al", "aligned_vggt": "_alv", "calib": "_cal", "calibK": "_calK"}
         variants = [f"gs_{crop}{size}_{rv['name']}{suffix[src]}" for crop in gcfg["crops"] for size in gcfg["sizes"]
                     for rv in gcfg["renders"] for src in gcfg.get("pose_sources", ["vggt"])]
         if (work / "tokens" / setup).exists():

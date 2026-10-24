@@ -119,6 +119,60 @@ class NumericsTests(unittest.TestCase):
         np.testing.assert_allclose(pm[:3, 3], [1, 0, 0])
         np.testing.assert_allclose(km, np.eye(3) * 1.5)
 
+    def _aligned_scene(self):
+        import cv2
+        from scipy.spatial.transform import Rotation
+        from lgs.aligned import aligned_reference, project, ray_plane
+        n, d = np.array([0.04, 0.01, 1.0]) / np.linalg.norm([0.04, 0.01, 1.0]), 30.0
+
+        def cam(c, yaw, f):
+            m = np.eye(4)
+            m[:3, :3] = Rotation.from_euler("y", yaw, degrees=True).as_matrix()
+            m[:3, 3] = c
+            return np.array([[f, 0, 958.0], [0, f, 541.0], [0, 0, 1]]), m
+
+        cams = {0: cam([-4, 0.1, 0.4], 9, 1790), 4: cam([0, 0, 0], 0, 1800), 8: cam([4, -0.1, 0.5], -8, 1820),
+                2: cam([-2.1, 0.15, 0.3], 5.5, 1850)}
+        S = np.array([[0.833, 0, 160], [0, 0.833, 90.0], [0, 0, 1]])
+        K_al, c2w_al = aligned_reference(cams[4][0], cams[4][1], S)
+        grid = np.stack(np.meshgrid(np.linspace(200, 1700, 10), np.linspace(150, 900, 8)), -1).reshape(-1, 2)
+        hs = {}
+        for k, (K, c2w) in cams.items():
+            X = ray_plane(K, c2w, grid, n, d)
+            hs[k] = cv2.findHomography(project(K, c2w, X)[0], project(K_al, c2w_al, X)[0], 0)[0]
+        return cams, hs, n, d
+
+    def test_aligned_domain_render_matches_real_camera_homography(self):
+        from lgs.aligned import project
+        from scripts.run_anysplat import aligned_setup, render_aligned
+        cams, hs, _, _ = self._aligned_scene()
+        win = (420, 0, 1080)
+        Y = np.array([[0.4, 0.2, 24.0]])  # off the zero-parallax plane (z ~ 30)
+
+        class MockRunner:
+            def render_px(self, state, c2w, K, w, h, keep=None, depth=False, **kw):
+                img = np.zeros((1, h, w, 3), np.float32)
+                (u, v), = project(np.asarray(K[0]), np.asarray(c2w[0]), Y)[0]
+                img[0, int(round(v)) - 1:int(round(v)) + 2, int(round(u)) - 1:int(round(u)) + 2] = 1
+                return img, np.ones((1, h, w), np.float32), np.full((1, h, w), 29.0, np.float32)
+
+        def crop_norm(K):
+            x0, y0, side = win
+            return np.array([[K[0, 0] / side, 0, (K[0, 2] - x0) / side], [0, K[1, 1] / side, (K[1, 2] - y0) / side],
+                             [0, 0, 1]])
+
+        ctx = [0, 4, 8]
+        state = {"ctx_c2w": np.stack([cams[c][1] for c in ctx]), "ctx_intr": np.stack([crop_norm(cams[c][0]) for c in ctx]),
+                 "size": 448, "tgt_c2w": np.stack([cams[2][1]])}
+        al = aligned_setup(MockRunner(), state, ctx, [2], win, hs, {"aligned_ref": 4, "aligned_pad_px": 160},
+                           {2: 0.5}, (1080, 1920))
+        self.assertLess(al["plane_rms_px"], 1e-3)
+        img, _, _ = render_aligned(MockRunner(), state, al, "aligned_vggt", None, {})[0]
+        v, u = np.unravel_index(np.argmax(img[..., 0]), img.shape[:2])
+        import cv2
+        exp = cv2.perspectiveTransform(project(cams[2][0], cams[2][1], Y)[0][None], hs[2])[0, 0]
+        self.assertLess(np.hypot(u - exp[0], v - exp[1]), 1.5)
+
     def test_target_poses_calib_identity_frame(self):
         from scripts.run_anysplat import target_poses
         c2w = np.repeat(np.eye(4)[None], 4, 0)
