@@ -2,6 +2,7 @@
 import numpy as np
 import torch
 from skimage.metrics import structural_similarity
+from scipy.stats import rankdata
 
 from .common import bbox
 
@@ -58,6 +59,5 @@ def auc(score, label, max_n=200000, seed=0):
     npos, nneg = label.sum(), (~label).sum()
     if npos == 0 or nneg == 0:
         return float("nan")
-    ranks = np.empty(len(score))
-    ranks[np.argsort(score, kind="mergesort")] = np.arange(1, len(score) + 1)
+    ranks = rankdata(score, method="average")
     return float((ranks[label].sum() - npos * (npos + 1) / 2) / (npos * nneg))

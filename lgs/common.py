@@ -128,6 +128,22 @@ def fill_holes(m):
     return (pad | (flood == 0))[1:-1, 1:-1].astype(bool)
 
 
+def cube_mask(img, ck, min_area=300):
+    """Saturated non-screen colors (Rubik's cube stickers); largest blob after closing, holes filled."""
+    hsv = cv2.cvtColor(to_u8(img), cv2.COLOR_RGB2HSV)
+    h, s, v = hsv[..., 0], hsv[..., 1], hsv[..., 2]
+    screen = (h >= ck["h_lo"]) & (h <= ck["h_hi"]) & (v < 170)
+    colorful = (s >= 120) & (v >= 100) & ~screen
+    m = cv2.morphologyEx(colorful.astype(np.uint8), cv2.MORPH_CLOSE, disk(7))
+    n, lab, stats, _ = cv2.connectedComponentsWithStats(m, connectivity=8)
+    if n <= 1:
+        return np.zeros(m.shape, bool)
+    best = 1 + int(np.argmax(stats[1:, cv2.CC_STAT_AREA]))
+    if stats[best, cv2.CC_STAT_AREA] < min_area:
+        return np.zeros(m.shape, bool)
+    return fill_holes(lab == best)
+
+
 def bbox(m, pad=0, shape=None):
     ys, xs = np.nonzero(m)
     if len(xs) == 0:

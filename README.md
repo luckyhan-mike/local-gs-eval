@@ -6,7 +6,7 @@
 
 - **光流**：Practical-RIFE，用两侧最近的输入相机合成目标相机，逐时刻真实推理（不做 t=0.5 线性外推）；
 - **局部 GS**：AnySplat 只用输入相机前馈生成高斯，在目标相机位姿处渲染；
-- **混合**：光流结果为底，在风险区内换成 GS，并羽化边界（可选光度增益校正）。
+- **混合**：光流结果为底，在指定区域内换成 GS，并羽化边界。
 
 全部比较都在单应对齐后的图像域（即现有光流管线的输入/输出域）中进行。
 
@@ -14,113 +14,136 @@
 
 ---
 
-## 1. 风险区域怎么定义（不依赖实验 1）
+## 0. 第二轮改动（相对 2026-10-24 第一轮实测）
 
-实验 1（风险检测）的结论还没出来，所以本实验对每个区域**都分别评价**：
+第一轮结论：GS 在光流失败区只比光流高 0.15 dB，且 SSIM/LPIPS 更差；但拼图显示 GS 把魔方补对了，误差主要是**全图几个像素的错位**和 **448 渲染再放大 2.4 倍的模糊**（`rest` 区 GS 19.6 dB vs 光流 33.2 dB）。第二轮针对这两点：
+
+1. **渲染方式与滤波核（参考 Mip-Splatting）**。每个 (裁剪, 输入分辨率) 只编码一次，用同一组高斯比较 5 种渲染方式（配置 `gs.renders`）：
+
+   | 变体后缀 | 渲染分辨率 | 滤波 | 说明 |
+   |---|---|---|---|
+   | `_in` | 输入分辨率 448，再放大到窗口 | 3DGS 原版膨胀 `Σ2D + 0.3I` | 第一轮的做法 |
+   | `_nat` | 窗口原生分辨率（center 1080 / roi ≈540） | `Σ2D + 0.3I` | 直接高分辨率渲染，不加补偿（预期出现变细、孔洞、锯齿） |
+   | `_nat_dil` | 原生 | `Σ2D + 0.3·(res/448)² I` | 按分辨率比例放大膨胀，相当于在输入网格上保持 0.3 px，对应你在 DirectLF 上"滤波核匹配渲染尺度"的结论 |
+   | `_nat_mip2d` | 原生 | Mip-Splatting 2D Mip 滤波：`Σ2D + 0.1I`，不透明度乘 `sqrt(det Σ2D / det(Σ2D+0.1I))` 做能量补偿（gsplat `antialiased` 模式） | 只做屏幕空间抗混叠 |
+   | `_nat_mip` | 原生 | 3D 平滑滤波 + 2D Mip 滤波 | **3D 滤波**：每个高斯按输入相机中最密的采样率 ν = f/d 限制最小尺度，`Σ3D + s/ν² I`（s=0.2），不透明度乘 `sqrt(det Σ3D / det Σ3D')`。可见性按输入相机视锥判断，不可见的取最大滤波 |
+
+   Mip-Splatting 的 3D 滤波原本在训练时计算（训练相机的最大采样率）；这里"训练"相机就是 AnySplat 的输入相机，因此直接用输入相机在 448 网格上的 f/d 计算，无需训练。
+
+2. **魔方 ROI 裁剪**（`crops: [center, roi]`）：在每台输入相机中用颜色检测魔方（高饱和、非绿幕色），取并集外接框四周加 80 px，得到一个正方形窗口（本场景约 540×540），放大倍数从 2.4 降到约 1.2。这才是"只在局部跑 GS"的设置。检测失败时可在 `gs.roi_window` 手动指定 `[x0, y0, side]`。
+
+3. **物体级评价区域 `object`**：真值中的魔方掩码膨胀 40 px（含手和魔方周围的遮挡带）。上一轮的 `oracle_fail` 按"光流误差大"定义，里面有大量细轮廓边，GS 只要有亚像素错位就被惩罚，对光流有利；`object` 不依赖任何一方的误差。
+
+4. **GS 配准诊断 `+reg`**：用真值对每个 GS 渲染做 ECC 配准（平移 → 仿射 → 单应逐级，在"前景除物体区"上拟合，每一级只有降低误差才保留）。`gs_x+reg` 与 `gs_x` 的差距 = 位姿/内参误差造成的损失；`registration.csv` 给出平均位移（px）。这是诊断用的上限，用到了真值，不是可部署的方法。
+
+5. **风险阈值扫描**：对 |W₀−W₁| × 共线残差的阈值网格，计算风险区相对 `oracle_fail` 的精确率、召回率、IoU 和面积比；IoU 最优的阈值用于 `hyb_risktuned[...]`（在同一数据上调参，偏乐观）。
+
+6. 合入第一轮 Linux 实测时的兼容修复：Python 3.9 的 AnySplat 注解兼容副本、联合位姿 aggregator 使用 bf16 autocast、AUC 并列值用平均秩。
+
+---
+
+## 1. 评价区域
 
 | 区域 | 定义 | 作用 |
 |---|---|---|
-| `oracle_fail` | 参考光流与真值的误差 > `eval.fail_err_thresh`（默认 0.08），膨胀 3 px | **核心结论区**：假设检测器完美，GS 能否补对光流算错的地方（上限） |
-| `risk` | 只用光流自身信号、固定阈值：\|W₀−W₁\| > 0.08 或双向光流共线残差 > 2 px，膨胀 9 px | 现实可得的简单检测器下，混合方案的效果预览 |
-| `edge` | 光流视差的水平梯度 > 0.3 | 深度突变处 |
-| `rest` | 前景中除去上面两类的部分 | 检查"平坦区域光流更清晰，不应替换" |
+| `object` | 真值魔方掩码膨胀 40 px ∩ 前景 | **第二轮主结论区**：GS 能否把光流搞坏的物体补对 |
+| `oracle_fail` | 参考光流与真值的误差 > 0.08，膨胀 3 px | 完美检测器假设下的失败区（上限） |
+| `risk` | 光流自身信号、配置中的固定阈值 | 现实可得的简单检测器 |
+| `edge` | 光流视差水平梯度 > 0.3 | 深度突变处 |
+| `rest` | 前景中除去 `risk` 与 `oracle_fail` | 检查平坦区光流是否更好 |
 | `fg` | 整个前景（绿幕抠像） | 整体质量 |
 
-光流脚本会保存全部原始信号（\|W₀−W₁\|、共线残差、RIFE mask 熵/梯度、视差梯度）。实验 1 得出更好的信号或阈值后，**只需修改配置的 `risk` 段并重跑 `evaluate.py`**（几分钟），不必重跑 RIFE 和 AnySplat。`risk.extra_rules` 可以增加任意信号的阈值规则，例如 `{mask_ent: 0.9}`。
+ROI 渲染只覆盖窗口内，表中 `覆盖` 列表示该方法在区域内有结果的比例；ROI 方法的 `fg`/`rest` 指标只针对窗口内部分，不能与整幅方法直接比较。**混合方法在窗口外回退到光流，覆盖始终为 1，可直接比较**。
 
-评估脚本还会顺带输出每个信号预测 `oracle_fail` 的 AUC，可以作为实验 1 的早期参考（仅单场景）。
+混合方法命名：
+
+- `hyb_oracle_fail[gs_x]`：在 `oracle_fail` 区内换成 GS（完美检测器上限）；
+- `hyb_risk[gs_x]`：在配置默认阈值的 `risk` 区内换成 GS；
+- `hyb_risktuned[gs_x]`：在扫描得到的最优阈值风险区内换成 GS；
+- `hyb_oracle_fail[gs_x+reg]`：配准后的 GS + 完美检测器，即"位姿准确时这条路线的上限"。
 
 ---
 
 ## 2. 环境
 
-在 Linux 3090 主机上，直接使用已经能跑 AnySplat 的 conda 环境（含 torch、gsplat、lpips、scikit-image、opencv、pyyaml）。RIFE 只需要 torch，不另装环境。
+在 Linux 3090 主机上使用能跑 AnySplat 的 conda 环境（含 torch、gsplat、lpips、scikit-image、scipy、opencv、pyyaml）。第一轮实测使用 `gspl`（Python 3.9.23、torch 2.0.1/CUDA 11.7、gsplat 1.5.3）：
 
 ```bash
-conda activate anysplat            # 换成你的 AnySplat 环境名
-pip install lpips scikit-image pyyaml opencv-python   # 已有则跳过
+conda activate gspl
+python -m pip install --no-deps --target work/compat_packages e3nn==0.5.6   # gspl 的 e3nn 0.6.0 需要更新的 torch；只装到实验目录
 ```
 
-需要的外部目录（相对于 `data_root`，可在配置中改为绝对路径）：
+- Python 3.9 下脚本会把 AnySplat 的 `src/` 复制到 `work/anysplat_py39/`，只转换类型注解里的 `|` 联合类型，不改原源码；
+- 若使用 `LGS_WORK_DIR`，上面 e3nn 的目标目录也要改成该目录下的 `compat_packages`；
+- 已缓存模型时可加 `HF_HUB_OFFLINE=1`。
 
-- `Practical-RIFE/train_log/IFNet_HDv3.py` 与 `train_log/flownet.pkl`
-- `AnySplat/`（源码），权重 `lhjiang/anysplat`（HF 缓存或本地目录，填到 `anysplat_ckpt`）
-- `北极星/0/魔方_9/`、`北极星/1/魔方_9/`
+需要的外部目录（相对于 `data_root`，可在配置中改为绝对路径）：`Practical-RIFE/train_log/{IFNet_HDv3.py,flownet.pkl}`、`AnySplat/`、`北极星/0/魔方_9/`、`北极星/1/魔方_9/`。
 
-## 3. 配置
-
-编辑 `configs/mofang_9cam.yaml`：
-
-- `data_root`：Linux 上对应 Windows `D:\hb` 的目录，默认 `/home/han/linux-han`，**请确认**。也可以不改文件，用环境变量 `LGS_DATA_ROOT=/your/path` 覆盖；
-- `setups`：输入相机组合，默认 `cam3: [0,4,8]`（大基线）与 `cam5: [0,2,4,6,8]`（中基线对照）；
-- 其余阈值先保持默认。
-
-## 4. 运行
+## 3. 运行
 
 ```bash
-git clone https://github.com/luckyhan-mike/local-gs-eval.git
-cd local-gs-eval
-bash run_all.sh configs/mofang_9cam.yaml
+cd local-gs-eval && git pull
+HF_HUB_OFFLINE=1 PYTHONUNBUFFERED=1 bash run_all.sh configs/mofang_9cam.yaml
+python -m unittest discover -s tests -v
 ```
 
-也可以分步运行（顺序不能换：t_pose 来自 AnySplat 的位姿）：
+**复用第一轮的 `work/`**：`prepare` 和光流结果与第一轮相同，可以只重跑 GS 和评估（约省一半时间）：
 
 ```bash
-python scripts/prepare.py      --config configs/mofang_9cam.yaml
-python scripts/run_anysplat.py --config configs/mofang_9cam.yaml --sizes 448 518 --crops center fg
-python scripts/run_flow.py     --config configs/mofang_9cam.yaml --scales 1.0 0.5 --tmodes uniform pose oracle
+rm -rf work/gs work/eval            # 旧 GS 目录命名不同；即使不删，evaluate 也会自动跳过
+python scripts/run_anysplat.py --config configs/mofang_9cam.yaml
+python scripts/run_flow.py     --config configs/mofang_9cam.yaml --tmodes pose   # t_pose 来自新的 center448 编码，数值应与第一轮几乎相同
 python scripts/evaluate.py     --config configs/mofang_9cam.yaml
+python scripts/validate_results.py configs/mofang_9cam.yaml
 ```
 
-预计耗时：prepare 约 1 分钟；AnySplat 共 2 个设置 × 4 个变体，每次几秒到几十秒；RIFE 的 oracle 搜索每个目标约 32 次推理，总共约几分钟；evaluate 约 5 分钟。显存方面，518 分辨率下 5 视点应该在 24 GB 以内；如果 OOM，先去掉 `--sizes 518` 或 `cam5`。
+预计：AnySplat 2 个设置 × 2 个裁剪各编码 1 次，每次 5 种渲染（1080² 原生渲染每视点几十毫秒）；evaluate 方法数约 66 个（6 光流 + 20 GS + 40 混合），约 10–20 分钟（ECC 配准与 SSIM 在 CPU 上）。
 
-### 各步骤做了什么
+### 各步骤输出（`work/`）
 
-| 步骤 | 内容 | 主要输出（`work/`） |
-|---|---|---|
-| `prepare.py` | 用 SIFT + MAGSAC 从"原图 ↔ 对齐图"反求每台相机的单应 H（原图→对齐图）；绿幕抠像得到前景 | `prepare/H_raw2aligned.npy`、`prepare/check_warp_*.png`、`prepare/prepare.json` |
-| `run_anysplat.py` | 在原图上按同一窗口裁剪（`center`：中心 1080×1080；`fg`：输入相机前景外接正方形），缩放到 448/518，AnySplat 只用输入相机生成高斯；用一次 VGGT 相机头联合估计全部相机位姿（目标图像只用于这一步，等价于刚性阵列的离线标定），Sim(3) 对齐到高斯坐标系后渲染目标相机，再贴回原图坐标、用 H 变到对齐域 | `gs/<setup>/gs_<crop><size>/cam{k}.png`、`meta.json`、`poses.json`；`poses/<setup>.json` |
-| `run_flow.py` | 对每个目标相机，用左右最近的输入相机做 RIFE 合成；t 取 `uniform`（按序号等分，现有做法）、`pose`（按估计光心在基线上的投影）、`oracle`（对真值网格搜索，上限）；scale 取 1.0 和 0.5（0.5 相当于扩大感受野，用于检验大位移） | `flow/<setup>/flow_s<scale>_<tmode>/cam{k}.png`、`cam{k}_signals.npz`、`cam{k}_risk.png` |
-| `evaluate.py` | 生成各区域，计算 PSNR/SSIM/LPIPS（LPIPS 在区域外接框内计算，区域外像素用真值填充）；构造混合结果；计算信号 AUC；输出对比拼图 | `eval/summary.md`、`eval/metrics.csv`、`eval/auc.csv`、`eval/<setup>/cam{k}_montage.png` |
-
-混合方法的命名：
-
-- `hyb_oracle[gs_x]`：在 `oracle_fail` 区内换成 GS（完美检测器上限）；
-- `hyb_risk[gs_x]`：在 `risk` 区内换成 GS；
-- `hyb_risk_gain[gs_x]`：同上，并按外环均值做逐通道光度增益校正。
+| 步骤 | 主要输出 |
+|---|---|
+| `prepare.py` | `prepare/H_raw2aligned.npy`、`check_warp_*.png`、`prepare.json`、前景掩码 |
+| `run_anysplat.py` | `gs/<setup>/gs_<crop><size>_<render>/cam{k}.png`（含 `_valid`、`_alpha`）、`meta.json`；`gs/<setup>/gs_<crop><size>_poses.json`；`poses/<setup>.json` |
+| `run_flow.py` | `flow/<setup>/flow_s<scale>_<tmode>/cam{k}.png`、`cam{k}_signals.npz`、`meta.json` |
+| `evaluate.py` | `eval/summary.md`（先看开头"关键对比"表）、`metrics.csv`、`auc.csv`、`registration.csv`、`risk_sweep.csv`、`<setup>/cam{k}_montage.png` |
+| `validate_results.py` | `eval/validation.json` |
 
 ---
 
-## 5. 需要得到的结果与判断标准
+## 4. 需要得到的结果与判断标准
 
-请把 `work/eval/summary.md`、`work/eval/*.csv`、`work/prepare/prepare.json`、`work/logs/` 和几张 `cam3` 的 `cam{k}_montage.png`（尤其是第 1、2、3 号相机，靠近魔方出错的一侧）发回来。
+请回传 `work/eval/` 下的 `summary.md`、全部 csv、`validation.json`，`work/logs/`，以及 `cam3` 的 `cam1/2/3/5_montage.png`。
 
-### 先检查（结果是否可信）
+### 先检查
 
-1. `prepare.json`：每台相机的 `warp_psnr_db` 应明显高于 30 dB。偏低说明对齐图不是原图的纯单应变换（例如做过锐化或裁剪），需要先看 `check_warp_*.png`；
-2. AnySplat 统计表：`输入视点自渲染 PSNR` 反映 GS 拟合能力的上限；`位姿对齐最大旋转误差` 应小于约 1°，`最大光心误差/基线` 应小于约 0.05，否则目标相机位姿不可靠，GS 结果偏低可能是位姿问题，不是 GS 本身的问题；
-3. 拼图中 GS 结果与真值没有整体平移或缩放。如果有，说明位姿或 H 出错。
+1. AnySplat 统计表中 `in` 变体的输入视点自渲染 PSNR 应与第一轮一致（center448 约 29 dB）；
+2. `registration.csv`：`center448_in` 的平均位移就是第一轮"全图错位"的量化值；
+3. 拼图中黄色轮廓（object）应套住魔方和手。
 
 ### 要回答的问题
 
 | # | 问题 | 看哪里 | 支持混合方案的结果 |
 |---|---|---|---|
-| H1 | 光流失败区内 GS 是否更好 | `cam3` 的 `oracle_fail` 表：`gs_*` 与 `flow_s1.0_uniform` | GS 的 PSNR/SSIM 更高、LPIPS 更低，差距越大越好 |
-| H2 | 平坦区内光流是否更好 | `rest` 表 | 光流更好（否则应考虑直接全图用 GS） |
-| H3 | 混合是否同时优于两者 | `fg` 表：`hyb_*` 与 `flow_*`、`gs_*` | `hyb_oracle` 明显优于两者；`hyb_risk` 越接近 `hyb_oracle`，说明简单检测器越够用 |
-| H4 | 基线影响 | `cam3` 与 `cam5` 对比 | `cam3` 中 `oracle_fail` 面积更大、GS 收益更大 |
-| H5 | GS 分辨率与裁剪的影响 | `gs_center448 / gs_center518 / gs_fg448 / gs_fg518` | 判断提高分辨率能否缓解"GS 偏软" |
-| H6 | 大位移是不是失败主因 | `flow_s0.5_*` 与 `flow_s1.0_*` | 若 scale=0.5 在 `oracle_fail` 上明显更好，说明主因是位移超出感受野 |
-| H7 | t 与空间位置是否对应（模块 A 的预验证） | t 估计对比表 | `t_pose` 比 `t_uniform` 更接近 `t_oracle`，且 `flow_*_pose` 优于 `flow_*_uniform` |
+| H1 | 物体区 GS 是否优于光流 | 关键对比表 `object` 列，cam3 | 最好的 GS（尤其 roi 变体）PSNR 高于 `flow_s1.0_uniform`，LPIPS 更低 |
+| H2 | 滤波核是否有效 | `object`/`rest` 表中同一裁剪下 `_in / _nat / _nat_dil / _nat_mip2d / _nat_mip` 的对比 | `_nat_mip` 或 `_nat_dil` 优于 `_in`（更清晰）且不劣于 `_nat`（无孔洞/锯齿） |
+| H3 | ROI 是否优于整幅裁剪 | `gs_roi448_*` vs `gs_center448_*` 在 `object` 区 | roi 更好（放大倍数更小） |
+| H4 | 错位是不是主要损失 | `gs_x` vs `gs_x+reg`、`registration.csv` | 若 `+reg` 在 object 区提升数 dB，说明瓶颈是位姿/内参，下一步应换标定板位姿或在线配准 |
+| H5 | 混合上限 | `hyb_oracle_fail[gs_x+reg]` vs `flow` 在 `fg` | 明显提升（+0.5 dB 以上且 LPIPS 下降）说明路线在位姿准确时成立 |
+| H6 | 现实检测器够不够 | `hyb_risktuned` 与 `hyb_oracle_fail` 的差距；风险扫描表 | 差距小、IoU 高 |
+| H7 | 光流侧改进 | `flow_s1.0_pose`、`flow_s0.5_pose` | 与第一轮一致：pose t 和 scale 0.5 有效 |
 
-**决策**：H1 和 H2 同时成立，并且 `hyb_oracle` 在 `fg` 上有可见提升（如 PSNR +0.5 dB 以上、LPIPS 下降），说明局部 GS 补全值得继续做；如果 H1 不成立（GS 在失败区也不比光流好），应先改进 GS 一侧（以位姿为条件的前馈模型、ROI 高分辨率、微调），或者转向几何一致的视差匹配路线。
+**决策**：
+- H1 成立（尤其 roi + Mip 滤波） → 局部 GS 补全值得继续，下一步重点是位姿精度和检测器；
+- H1 不成立但 H4/H5 成立（`+reg` 后成立） → 路线本身可行，瓶颈是目标相机位姿/内参，先解决标定；
+- 配准后仍不成立 → GS 本身质量不足，应转向几何一致的视差匹配 + 多视图 warp，或以位姿为条件的前馈模型。
 
 ---
 
-## 6. 已知局限
+## 5. 已知局限
 
-- 只有魔方一个场景、单帧，结论需要在挥手等场景上复核（新建一个配置文件即可）；
-- 目标相机位姿由 VGGT 联合估计（用到了目标图像，但只用于位姿，相当于阵列标定），没有用标定板真值；
-- 对齐图到原图的 H 是反求得到的，若原对齐流程不是纯单应会有残差（见 `prepare.json`）；
-- AnySplat 输入为正方形裁剪，`center` 模式会裁掉画面两侧的背景，所有方法都只在 GS 有效区域内比较；
-- `oracle_fail` 与 `oracle` t 用到了真值，只能作为上限，不能当作方法本身的结果。
+- 只有魔方一个场景、单帧；
+- 目标相机位姿由 VGGT 联合估计（目标图像只用于位姿，相当于阵列标定），没有标定板真值；
+- `+reg`、`oracle_fail`、`oracle` t、`hyb_risktuned` 的阈值都用到了真值，只能作为诊断或上限；
+- Mip-Splatting 的 3D 滤波在这里用输入相机在 448 网格上的采样率，没有经过训练阶段联合优化；
+- 魔方检测是基于颜色的启发式，只适用于本场景；其他场景请手动指定 `gs.roi_window`。

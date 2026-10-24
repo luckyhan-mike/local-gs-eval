@@ -1,8 +1,13 @@
-"""AnySplat feed-forward GS: Gaussians from context views, rendering at held-out camera poses.
+"""AnySplat feed-forward GS: Gaussians from context views, rendered at held-out camera poses.
 
 Target poses come from one joint VGGT camera-head pass over all cameras of the rig. Target images
 are used only for that pose estimate (equivalent to calibrating a fixed rig once); the Gaussians
 are predicted from the context views alone.
+
+Rendering goes through gsplat directly so the screen-space / 3D filters can be varied:
+  classic + eps2d      original 3DGS dilation (AnySplat default eps2d=0.3 at the input resolution)
+  antialiased + eps2d  Mip-Splatting 2D Mip filter (dilation with opacity energy compensation)
+  filter3d             Mip-Splatting 3D smoothing filter, sampling rate from the context cameras
 """
 import sys
 import time
@@ -37,13 +42,43 @@ def rot_angle_deg(ra, rb):
     return float(np.degrees(np.arccos(np.clip(c, -1, 1))))
 
 
+def mip_filter3d(means, cov, opacity, ctx_c2w, ctx_intr_norm, size, var=0.2):
+    """Mip-Splatting 3D smoothing: cov + var*(d/f)^2 I with d/f from the densest context sampling.
+
+    Returns filtered covariances, energy-compensated opacities and the per-Gaussian filter std.
+    """
+    nu = torch.zeros(len(means), device=means.device)
+    for c2w, intr in zip(ctx_c2w, ctx_intr_norm):
+        w2c = torch.linalg.inv(torch.as_tensor(c2w, device=means.device, dtype=torch.float32))
+        k = torch.as_tensor(intr, device=means.device, dtype=torch.float32)
+        pc = means @ w2c[:3, :3].T + w2c[:3, 3]
+        z = pc[:, 2]
+        fx, fy = k[0, 0] * size, k[1, 1] * size
+        u = fx * pc[:, 0] / z.clamp(min=1e-6) + k[0, 2] * size
+        v = fy * pc[:, 1] / z.clamp(min=1e-6) + k[1, 2] * size
+        vis = (z > 1e-3) & (u > -0.15 * size) & (u < 1.15 * size) & (v > -0.15 * size) & (v < 1.15 * size)
+        nu = torch.where(vis, torch.maximum(nu, fx / z.clamp(min=1e-6)), nu)
+    if (nu > 0).any():
+        nu = torch.where(nu > 0, nu, nu[nu > 0].min())
+    else:
+        nu = torch.ones_like(nu)
+    s2 = var / nu ** 2
+    eye = torch.eye(3, device=means.device)
+    cov2 = cov + s2[:, None, None] * eye
+    det0 = torch.linalg.det(cov).clamp(min=0)
+    det1 = torch.linalg.det(cov2).clamp(min=1e-30)
+    return cov2, opacity * torch.sqrt(det0 / det1), torch.sqrt(s2)
+
+
 class AnySplatRunner:
     def __init__(self, anysplat_dir, ckpt, device="cuda"):
         sys.path.insert(0, anysplat_dir)
         from src.model.model.anysplat import AnySplat  # noqa: E402
         from src.model.encoder.vggt.utils.pose_enc import pose_encoding_to_extri_intri  # noqa: E402
+        from gsplat import rasterization  # noqa: E402
 
         self.pose_dec = pose_encoding_to_extri_intri
+        self.rasterization = rasterization
         self.device = device
         self.model = AnySplat.from_pretrained(ckpt).to(device).eval()
         for p in self.model.parameters():
@@ -57,9 +92,10 @@ class AnySplatRunner:
     @torch.no_grad()
     def joint_poses(self, x_all):
         enc = self.model.encoder
-        with torch.amp.autocast("cuda", enabled=False):
+        with torch.amp.autocast("cuda", enabled=True, dtype=torch.bfloat16):
             tokens, _ = enc.aggregator(x_all.to(torch.bfloat16),
                                        intermediate_layer_idx=enc.cfg.intermediate_layer_idx)
+        with torch.amp.autocast("cuda", enabled=False):
             tokens = [tk.float() for tk in tokens]
             pose_enc = enc.camera_head(tokens)[-1]
             w2c, intr = self.pose_dec(pose_enc, x_all.shape[-2:])
@@ -72,76 +108,80 @@ class AnySplatRunner:
         return c2w[0].cpu().numpy(), intr[0].cpu().numpy()
 
     @torch.no_grad()
-    def render(self, gaussians, c2w, intr_norm, size):
-        v = len(c2w)
-        out = self.model.decoder.forward(
-            gaussians,
-            torch.from_numpy(c2w).float()[None].to(self.device),
-            torch.from_numpy(intr_norm).float()[None].to(self.device),
-            torch.ones(1, v, device=self.device) * 0.01,
-            torch.ones(1, v, device=self.device) * 100,
-            (size, size),
-        )
-        color = out.color[0].permute(0, 2, 3, 1).float().cpu().numpy()  # V,S,S,3
-        alpha = out.alpha[0].float().cpu().numpy().reshape(v, size, size)
-        return color, alpha
-
-    def run(self, ctx_imgs, tgt_imgs, size):
-        """ctx_imgs/tgt_imgs: lists of SxSx3 uint8 crops. Returns renders, poses and diagnostics."""
-        dev = self.device
-        x_ctx = self._batch(ctx_imgs, dev)
-        x_all = self._batch(list(ctx_imgs) + list(tgt_imgs), dev)
+    def encode(self, ctx_imgs, tgt_imgs, size):
+        """ctx_imgs/tgt_imgs: lists of SxSx3 uint8 crops. Gaussians + target poses in the GS frame."""
+        x_ctx = self._batch(ctx_imgs, self.device)
+        x_all = self._batch(list(ctx_imgs) + list(tgt_imgs), self.device)
         nc = len(ctx_imgs)
-
         torch.cuda.synchronize()
         t0 = time.time()
         self.model.encoder.distill = False
         enc_out = self.model.encoder(x_ctx, global_step=0, visualization_dump=None)
         torch.cuda.synchronize()
         t_enc = time.time() - t0
-        gaussians = enc_out.gaussians
-        ctx_c2w_enc = enc_out.pred_context_pose["extrinsic"][0].float().cpu().numpy()
-        ctx_intr_enc = enc_out.pred_context_pose["intrinsic"][0].float().cpu().numpy()
+        ctx_c2w = enc_out.pred_context_pose["extrinsic"][0].float().cpu().numpy()
+        ctx_intr = enc_out.pred_context_pose["intrinsic"][0].float().cpu().numpy()
 
         all_c2w, all_intr = self.joint_poses(x_all)
-        s, r, t = sim3_from_cams(all_c2w[:nc], ctx_c2w_enc)
+        s, r, t = sim3_from_cams(all_c2w[:nc], ctx_c2w)
         aligned = apply_sim3(all_c2w, s, r, t)
-        base = np.linalg.norm(ctx_c2w_enc[-1, :3, 3] - ctx_c2w_enc[0, :3, 3]) + 1e-12
-        center_err = [float(np.linalg.norm(aligned[i, :3, 3] - ctx_c2w_enc[i, :3, 3]) / base) for i in range(nc)]
-        rot_err = [rot_angle_deg(aligned[i, :3, :3], ctx_c2w_enc[i, :3, :3]) for i in range(nc)]
-
-        torch.cuda.synchronize()
-        t0 = time.time()
-        tgt_rgb, tgt_alpha = self.render(gaussians, aligned[nc:], all_intr[nc:], size)
-        torch.cuda.synchronize()
-        t_render = (time.time() - t0) / max(len(tgt_imgs), 1)
-        ctx_rgb, _ = self.render(gaussians, ctx_c2w_enc, ctx_intr_enc, size)
-        ctx_psnr = []
-        for i in range(nc):
-            mse = np.mean((ctx_rgb[i] - ctx_imgs[i].astype(np.float32) / 255.0) ** 2)
-            ctx_psnr.append(float(-10 * np.log10(max(mse, 1e-10))))
-
-        return {
-            "tgt_rgb": tgt_rgb,
-            "tgt_alpha": tgt_alpha,
+        base = np.linalg.norm(ctx_c2w[-1, :3, 3] - ctx_c2w[0, :3, 3]) + 1e-12
+        g = enc_out.gaussians
+        state = {
+            "gaussians": g, "size": size,
+            "ctx_c2w": ctx_c2w, "ctx_intr": ctx_intr,
+            "tgt_c2w": aligned[nc:], "tgt_intr": all_intr[nc:],
             "all_c2w_joint": all_c2w,
-            "num_gaussians": int(gaussians.means.shape[1]),
-            "time_encode_s": t_enc,
-            "time_render_per_view_s": t_render,
-            "sim3_scale": float(s),
-            "ctx_center_err_rel_baseline": center_err,
-            "ctx_rot_err_deg": rot_err,
-            "ctx_self_psnr": ctx_psnr,
         }
+        diag = {
+            "num_gaussians": int(g.means.shape[1]),
+            "time_encode_s": t_enc,
+            "sim3_scale": float(s),
+            "ctx_center_err_rel_baseline": [float(np.linalg.norm(aligned[i, :3, 3] - ctx_c2w[i, :3, 3]) / base)
+                                            for i in range(nc)],
+            "ctx_rot_err_deg": [rot_angle_deg(aligned[i, :3, :3], ctx_c2w[i, :3, :3]) for i in range(nc)],
+        }
+        ctx_rgb, _ = self.render(state, ctx_c2w, ctx_intr, size)
+        diag["ctx_self_psnr"] = [float(-10 * np.log10(max(np.mean((ctx_rgb[i] - ctx_imgs[i] / 255.0) ** 2), 1e-10)))
+                                 for i in range(nc)]
+        return state, diag
+
+    @torch.no_grad()
+    def render(self, state, c2w, intr_norm, res, mode="classic", eps2d=0.3, filter3d=False, filter3d_var=0.2):
+        """Render views at res x res. Returns (V,res,res,3) colors, (V,res,res) alpha."""
+        g, dev = state["gaussians"], self.device
+        means = g.means[0].float()
+        cov = g.covariances[0].float()
+        op = g.opacities[0].float().reshape(-1)
+        if filter3d:
+            cov, op, _ = mip_filter3d(means, cov, op, state["ctx_c2w"], state["ctx_intr"],
+                                      state["size"], filter3d_var)
+        feat = g.harmonics[0].permute(0, 2, 1).float().contiguous()  # N,K,3
+        sh_degree = int(round(np.sqrt(feat.shape[1]))) - 1
+        bg = self.model.decoder.background_color.float().to(dev)[None]
+        colors, alphas = [], []
+        for j in range(len(c2w)):
+            viewmat = torch.linalg.inv(torch.as_tensor(c2w[j], dtype=torch.float32, device=dev))[None]
+            k = torch.as_tensor(intr_norm[j], dtype=torch.float32, device=dev).clone()
+            k[0] *= res
+            k[1] *= res
+            rgb, alpha, _ = self.rasterization(
+                means, g.rotations[0].float(), g.scales[0].float(), op, feat, viewmat, k[None], res, res,
+                sh_degree=sh_degree, render_mode="RGB", packed=False, near_plane=1e-10,
+                backgrounds=bg, radius_clip=0.1, covars=cov, rasterize_mode=mode, eps2d=float(eps2d))
+            colors.append(rgb[0].clamp(0, 1).cpu().numpy())
+            alphas.append(alpha[0, ..., 0].cpu().numpy())
+        return np.stack(colors), np.stack(alphas)
 
 
 def paste_and_warp(render, alpha, window, raw_shape, homography, aligned_shape):
-    """Put an SxS crop render back into the raw frame, then warp into the aligned frame."""
+    """Put a square crop render back into the raw frame, then warp into the aligned frame."""
     x0, y0, side = window
     h, w = raw_shape
     canvas = np.zeros((h, w, 3), np.float32)
     acanvas = np.zeros((h, w), np.float32)
-    canvas[y0:y0 + side, x0:x0 + side] = cv2.resize(render, (side, side), interpolation=cv2.INTER_CUBIC)
+    interp = cv2.INTER_CUBIC if render.shape[0] < side else cv2.INTER_AREA
+    canvas[y0:y0 + side, x0:x0 + side] = cv2.resize(render, (side, side), interpolation=interp)
     acanvas[y0:y0 + side, x0:x0 + side] = cv2.resize(alpha, (side, side), interpolation=cv2.INTER_LINEAR)
     win = np.zeros((h, w), np.uint8)
     win[y0:y0 + side, x0:x0 + side] = 1

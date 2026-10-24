@@ -23,6 +23,20 @@ chroma:                                 # 绿幕抠像（OpenCV HSV，H∈[0,180
   v_min: 30
   min_area_frac: 0.002
 
+gs:
+  sizes: [448]                          # AnySplat 训练分辨率；上一轮 518 的输入视点自渲染明显退化
+  crops: [center, roi]                  # center: 中心 1080x1080；roi: 输入相机中魔方外接框+边距；fg: 人物外接框
+  roi_pad_px: 80                        # ROI 在魔方外接框四周的边距（覆盖手和遮挡带）
+  roi_min_side: 448                     # ROI 最小边长（不小于输入分辨率，避免下采样以外的放大）
+  roi_window: null                      # 手动指定 [x0, y0, side] 可跳过自动检测
+  filter3d_var: 0.2                     # Mip-Splatting 3D 平滑滤波方差系数 s（σ² = s·(d/f)²）
+  renders:                              # 每个 (crop, size) 只编码一次，下列渲染方式复用同一组高斯
+    - {name: in,        res: input,  mode: classic,     eps2d: 0.3,  filter3d: false}  # 上一轮做法：448 渲染后放大
+    - {name: nat,       res: native, mode: classic,     eps2d: 0.3,  filter3d: false}  # 直接按窗口原生分辨率渲染
+    - {name: nat_dil,   res: native, mode: classic,     eps2d: auto, filter3d: false}  # 膨胀按分辨率比例放大：0.3·(res/size)²
+    - {name: nat_mip2d, res: native, mode: antialiased, eps2d: 0.1,  filter3d: false}  # Mip-Splatting 2D Mip 滤波
+    - {name: nat_mip,   res: native, mode: antialiased, eps2d: 0.1,  filter3d: true}   # Mip-Splatting 3D 平滑 + 2D Mip
+
 risk:                                   # 光流自身信号 → 风险区域（不使用真值）
   warp_thresh: 0.08                     # |W0-W1| 通道均值阈值（0~1）
   col_thresh: 2.0                       # 双向光流共线残差阈值（像素）
@@ -35,4 +49,7 @@ eval:
   edge_thresh: 0.3                      # 视差水平梯度阈值（像素/像素）
   edge_dilate_px: 5
   feather_sigma: 3.0                    # 混合羽化
-  ring_px: 15                           # 光度增益校正所用外环宽度
+  object_dilate_px: 40                  # 物体级区域：真值中魔方掩码膨胀（含手和魔方周围的遮挡带）
+  reg_min_px: 2000                      # GS 配准诊断所需的最少前景像素
+  sweep_warp: [0.06, 0.08, 0.10, 0.12, 0.15, 0.20, 0.25, 0.30, 0.40]   # 风险阈值扫描（|W0-W1|）
+  sweep_col: [2.0, 3.0, 4.0, 6.0, 1.0e+9]                 # 共线残差阈值，1e9 表示不用该信号
