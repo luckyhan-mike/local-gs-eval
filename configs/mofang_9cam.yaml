@@ -1,0 +1,38 @@
+# 魔方场景：9 路水平会聚相机阵列（北极星/0 原图，北极星/1 单应对齐图）
+# 所有相对路径都相对于 data_root；可用环境变量 LGS_DATA_ROOT 覆盖 data_root。
+data_root: /home/han/linux-han          # 对应 Windows 上的 D:\hb，按实际挂载位置修改
+work_dir: work                          # 输出目录（相对于本仓库根目录，或写绝对路径）
+
+num_cams: 9
+raw_pattern: "北极星/0/魔方_9/grid_{:02d}.png"            # 会聚相机原图（AnySplat 输入）
+aligned_pattern: "北极星/1/魔方_9/aligned_grid_{:02d}.png" # 单应对齐到中心相机后的图（光流输入/真值）
+
+rife_dir: Practical-RIFE                # 需包含 train_log/IFNet_HDv3.py 与 train_log/flownet.pkl
+anysplat_dir: AnySplat                  # AnySplat 源码根目录
+anysplat_ckpt: lhjiang/anysplat         # HF 仓库名或本地目录
+
+# 留一法设置：context 为输入相机，区间内其余相机作为真值目标
+setups:
+  cam3: {context: [0, 4, 8]}            # 与 2-3/魔方_9 实验一致（大基线）
+  cam5: {context: [0, 2, 4, 6, 8]}      # 中等基线对照
+
+chroma:                                 # 绿幕抠像（OpenCV HSV，H∈[0,180]）
+  h_lo: 35
+  h_hi: 90
+  s_min: 50
+  v_min: 30
+  min_area_frac: 0.002
+
+risk:                                   # 光流自身信号 → 风险区域（不使用真值）
+  warp_thresh: 0.08                     # |W0-W1| 通道均值阈值（0~1）
+  col_thresh: 2.0                       # 双向光流共线残差阈值（像素）
+  dilate_px: 9
+  fg_dilate_px: 15
+
+eval:
+  ref_flow: flow_s1.0_uniform           # 用于定义风险区域与混合的参考光流结果
+  fail_err_thresh: 0.08                 # 光流误差 > 该值视为“光流失败”（oracle 区域与 AUC 标签）
+  edge_thresh: 0.3                      # 视差水平梯度阈值（像素/像素）
+  edge_dilate_px: 5
+  feather_sigma: 3.0                    # 混合羽化
+  ring_px: 15                           # 光度增益校正所用外环宽度
