@@ -58,7 +58,7 @@ pip install lpips scikit-image pyyaml opencv-python   # 已有则跳过
 ## 4. 运行
 
 ```bash
-git clone https://github.com/hhan70701/local-gs-eval.git
+git clone https://github.com/luckyhan-mike/local-gs-eval.git
 cd local-gs-eval
 bash run_all.sh configs/mofang_9cam.yaml
 ```
