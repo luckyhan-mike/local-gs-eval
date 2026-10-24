@@ -188,7 +188,7 @@ class AnySplatRunner:
             out, alpha, _ = self.rasterization(
                 means, quats, scales, op, feat, viewmat, k[None], int(width), int(height),
                 sh_degree=sh_degree, render_mode="RGB+ED" if depth else "RGB", packed=False, near_plane=1e-10,
-                backgrounds=torch.cat([bg, bg.new_zeros(1, 1)], 1) if depth else bg,
+                backgrounds=bg,
                 radius_clip=0.1, covars=cov, rasterize_mode=mode, eps2d=float(eps2d))
             colors.append(out[0, ..., :3].clamp(0, 1).cpu().numpy())
             alphas.append(alpha[0, ..., 0].cpu().numpy())

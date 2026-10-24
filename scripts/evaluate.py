@@ -177,7 +177,8 @@ def main():
             gs_rows.append([setup, gv, m.get("pose_source", "vggt"), m["window"][2], m["render_res"], m["render"]["mode"],
                             m["eps2d_used"], m["render"]["filter3d"], m["num_gaussians"], m["time_encode_s"],
                             m["time_render_per_view_s"], float(np.mean(m["ctx_self_psnr"])),
-                            max(pd["ctx_rot_err_deg"]), max(pd["ctx_center_err_rel_baseline"])])
+                            max(pd.get("ctx_rot_err_deg", m["ctx_rot_err_deg"])),
+                            max(pd.get("ctx_center_err_rel_baseline", m["ctx_center_err_rel_baseline"]))])
         full_frame = [gv for gv in gs_vars if gs_meta[gv]["crop"] in ("center", "fg")]
         flow_meta = {fv: load_json(flow_dir / fv / "meta.json") for fv in flow_vars}
         for k in targets:
