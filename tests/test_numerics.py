@@ -410,6 +410,25 @@ class NumericsTests(unittest.TestCase):
         self.assertEqual(scope['y'], 3)
         self.assertEqual(scope['f'](1), 1)
 
+    def test_dataset6_calib_t_and_wall_key(self):
+        import cv2
+        from lgs.common import chroma_fg
+        from scripts.run_scenes import calib_t
+        centers = [[0, 0, 0], [100, 2, 0], [250, -1, 5], [360, 0, 0], [470, 0, 0], [600, 0, 0]]
+        t = calib_t({"rig": {"centers_mm": centers}}, [0, 3, 5], [1, 2, 4])
+        self.assertAlmostEqual(t["1"], 100 / 360, places=3)
+        self.assertAlmostEqual(t["2"], 250 / 360, places=3)
+        self.assertAlmostEqual(t["4"], 110 / 240, places=3)
+        # blue-grey wall (H~105, S~43, V~99) keyed out, a dark shirt and an orange pillow kept
+        hsv = np.zeros((120, 160, 3), np.uint8)
+        hsv[:] = (105, 43, 99)
+        hsv[30:90, 20:70] = (0, 0, 25)
+        hsv[30:90, 90:140] = (15, 170, 200)
+        rgb = cv2.cvtColor(hsv, cv2.COLOR_HSV2RGB)
+        fg = chroma_fg(rgb, dict(h_lo=95, h_hi=130, s_min=10, s_max=110, v_min=50, min_area_frac=0.002))
+        self.assertFalse(fg[5, 5])
+        self.assertTrue(fg[60, 45] and fg[60, 115])
+
 
 if __name__ == '__main__':
     unittest.main()

@@ -111,6 +111,8 @@ def chroma_fg(img, ck):
     hsv = cv2.cvtColor(to_u8(img), cv2.COLOR_RGB2HSV)
     h, s, v = hsv[..., 0], hsv[..., 1], hsv[..., 2]
     green = (h >= ck["h_lo"]) & (h <= ck["h_hi"]) & (s >= ck["s_min"]) & (v >= ck["v_min"])
+    if "s_max" in ck:  # low-saturation backdrop (e.g. a grey wall instead of a green screen)
+        green &= s <= ck["s_max"]
     fg = (~green) & (to_u8(img).max(-1) > 8)
     fg = cv2.morphologyEx(fg.astype(np.uint8), cv2.MORPH_OPEN, disk(2))
     fg = cv2.morphologyEx(fg, cv2.MORPH_CLOSE, disk(5))

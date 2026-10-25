@@ -14,7 +14,55 @@
 
 ---
 
-## 0. 第十二轮：精简实验 + 逐视图裁剪 TTO（当前主实验，配置 `configs/mofang_9cam_lean.yaml`）
+## 0. 六路新数据集上的局部 GS 验证（配置 `configs/dataset6_lean.yaml`，脚本 `scripts/run_scenes.py`）
+
+方法和第十二轮的精简流程完全相同：token 变体 rife，`_al` 对齐域，直接贴回并附 oracle 上限，前馈 + TTO 50 / 100 / 200 步，逐视图裁剪监督。只把数据换成六路阵列数据集（2304×1296 原图 `datasets/`，标定在 `datasets_1080/calib/`，灰墙背景）。
+
+**相机组合**：输入 0 / 3 / 5（间距约 359 / 233 mm），真值是 1、2、4 号。
+
+**场景**：从宫格图里挑了 5 组，手、抱枕、小物件挡在人前，或人离相机很近，写在 `dataset6.shots` 里，可以增删：
+- `changjing/shot_0007`：抱枕举在脸前
+- `changjing/shot_0003`：双手挡在脸前
+- `changjing1/shot_0012`：手拿小物件挡在脸前
+- `changjing1/shot_0032`：书挡在脸前
+- `changjing2/shot_0000`：人离相机很近
+
+**和魔方数据的差别（都写在配置里）**：
+- **对齐图**：和 video-tell 的几何一致（见 `datasets_1080/README.md` 第 6 节）。`prepare.py` 在 **2304×1296 原图**上以 cam3 为参考做单应对齐，再中心裁出 **1920×1088**，用的矩阵是 `homographies_cam3_raw2304_to_crop1920x1088.npy`。
+  - 不先缩小，像素尺度与原图相同；cam0、cam1 只有约 0.3% 的黑边。
+  - cam3 是输入相机，`H_3` 只是平移裁剪，所以对齐域相机不会出现斜切。
+  - 没有去畸变。
+  - AnySplat 的输入是 2304 原图上的裁剪窗口。
+- **前景**：用背景墙抠像代替绿幕。`chroma` 设为墙面的蓝灰色、低饱和区间，新增 `s_max`。
+- **object 区域**：真值中最大的高饱和色块（抱枕、水果、书）膨胀 40 px；没有彩色物体的场景（只有手或人）该区域为空。
+- **插值时刻 t**：由标定的相机光心计算，即目标光心在两侧输入光心连线上的投影位置，写入每组的 `poses/in035.json`。不用目标图，也不用 VGGT 联合估计。
+
+**跑法**：需要的数据是 `data_root/datasets/<场景>/<shot>/view_0..5.png`（原图，可以只拷选中的 shot）和 `data_root/datasets_1080/calib/`，不需要第七轮的复用目录。每组场景依次运行 prepare → token 检测 → GS（含 TTO）→ 参考光流 → 评估 → 验证，各自的工作目录在 `work/dataset6/<场景>_<shot>/`。
+
+```bash
+cd local-gs-eval && git pull
+export HF_HUB_OFFLINE=1 PYTHONUNBUFFERED=1      # 第一次运行、权重还没缓存时不要设 HF_HUB_OFFLINE
+python -m unittest discover -s tests -v
+python scripts/run_scenes.py --config configs/dataset6_lean.yaml 2>&1 | tee work/dataset6_run.log
+```
+
+- 只跑某几组：加 `--shots changjing1/shot_0012 changjing/shot_0007`。
+- 某一步失败后重跑：从失败的步骤开始，例如 `--steps anysplat flow evaluate validate`。
+- 只重新汇总：加 `--summary-only`。
+
+**结果**：
+- 汇总在 `work/dataset6/summary_all.md`：逐场景、全部场景合计两张表（纯光流 / 前馈 / TTO 各步数 × 直接 / oracle），以及耗时。
+- 每组场景的完整 `eval/summary.md`、对比图和日志在各自的工作目录里。
+
+上传结果时，把 `work/dataset6/` 下除 `aligned/`、`gs/`、`flow/` 大图以外的内容打包，即 `summary_all.md`，以及各组的 `eval/`、`logs/`、`timing.json`、`config.yaml`、`poses/`、`prepare/prepare.json`、`tokens/tokens.json`。另外附上每组 `eval/<setup>/cam*_montage.png`。
+
+**判断标准**：
+1. 光流在这组数据上是否真的失败：纯光流的 fg / object 指标，以及 oracle_fail 面积。如果光流几乎不失败，GS 也就没有用武之地。
+2. 局部 GS 能否超过光流：直接贴回的 fg 两项指标和不差目标数，前馈与 TTO 分开看。
+3. 和魔方数据的结论是否一致：前馈单独不够，TTO 50–100 步后超过光流。
+4. 耗时：编码时间、监督框面积、各检查点的累计时间。
+
+## 0.1 第十二轮：精简实验 + 逐视图裁剪 TTO（配置 `configs/mofang_9cam_lean.yaml`）
 
 第十一轮结论：
 - **质量**：TTO 在 100 步左右就基本到顶。cam3 只要 50 步（3.5 s）就 6/6 不差；cam5 要 200 步（24.5 s）才 3/4 不差。300 步的质量与第十轮持平，说明裁剪监督不掉质量。

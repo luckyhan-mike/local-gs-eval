@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
-"""Step 0: estimate raw->aligned homographies and foreground masks for every camera."""
+"""Step 0: estimate raw->aligned homographies and foreground masks for every camera.
+
+With cfg["homographies"] (a calibrated (N, 3, 3) raw->aligned .npy relative to data_root, e.g. the
+six-camera dataset) the aligned images are generated here by warping the raw views to
+cfg["aligned_size"] (default: the raw size), instead of being read from disk and matched with SIFT."""
 import argparse
 import sys
 from pathlib import Path
@@ -34,10 +38,17 @@ def main():
     cfg = load_cfg(args.config)
     out = Path(cfg["work_dir"]) / "prepare"
     hs, report = [], {}
+    given = np.load(Path(cfg["data_root"]) / cfg["homographies"]) if cfg.get("homographies") else None
     for k in range(cfg["num_cams"]):
         raw = imread_rgb(cam_path(cfg, "raw", k))
-        al = imread_rgb(cam_path(cfg, "aligned", k))
-        h, ninl, nmatch = estimate_h(raw, al)
+        if given is not None:
+            h, ninl, nmatch = given[k].astype(np.float64), 0, 0
+            w_al, h_al = cfg.get("aligned_size") or (raw.shape[1], raw.shape[0])
+            al = cv2.warpPerspective(raw, h, (int(w_al), int(h_al)), flags=cv2.INTER_LINEAR)
+            imwrite(cam_path(cfg, "aligned", k), al)
+        else:
+            al = imread_rgb(cam_path(cfg, "aligned", k))
+            h, ninl, nmatch = estimate_h(raw, al)
         hh, ww = al.shape[:2]
         warped = cv2.warpPerspective(raw, h, (ww, hh), flags=cv2.INTER_LINEAR)
         valid = cv2.warpPerspective(np.ones(raw.shape[:2], np.uint8), h, (ww, hh)) > 0

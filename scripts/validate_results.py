@@ -64,16 +64,17 @@ def main():
             for k in targets:
                 assert imread_rgb(folder / f"cam{k}.png").shape[2] == 3
                 counts["gs_renders"] += 1
-        for scale in (1.0, 0.5):
-            for mode in ("uniform", "pose", "oracle"):
-                folder = work / "flow" / setup / f"flow_s{scale}_{mode}"
-                meta = load_json(folder / "meta.json")
-                assert set(meta) == {str(k) for k in targets}
-                for k in targets:
-                    with np.load(folder / f"cam{k}_signals.npz") as sig:
-                        for name in ("r_warp", "r_col", "g_disp", "mask_ent", "mask_grad", "flow"):
-                            assert np.isfinite(sig[name]).all(), (folder, k, name)
-                    counts["flow_renders"] += 1
+        flows = ([cfg["eval"]["ref_flow"]] if cfg.get("eval", {}).get("lean")
+                 else [f"flow_s{scale}_{mode}" for scale in (1.0, 0.5) for mode in ("uniform", "pose", "oracle")])
+        for flow in flows:
+            folder = work / "flow" / setup / flow
+            meta = load_json(folder / "meta.json")
+            assert set(meta) == {str(k) for k in targets}
+            for k in targets:
+                with np.load(folder / f"cam{k}_signals.npz") as sig:
+                    for name in ("r_warp", "r_col", "g_disp", "mask_ent", "mask_grad", "flow"):
+                        assert np.isfinite(sig[name]).all(), (folder, k, name)
+                counts["flow_renders"] += 1
         for k in targets:
             imread_rgb(work / "eval" / setup / f"cam{k}_montage.png")
             counts["montages"] += 1
