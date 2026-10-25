@@ -37,10 +37,14 @@ tokens:                                 # 输入相机上的不可靠区域检�
   paste_feather_px: 8                   # 贴回羽化宽度（落在重建边距内，双方都可靠的区域）
   ring_px: 24                           # 环带配准：在贴回区外这一圈用光流结果做参考（不用真值）
   primary: rife                         # center 等非 token 裁剪的局部高斯用哪个变体
-  variants:                             # 每个变体单独输出 tokens/<setup>/<name>/，run_anysplat 对每个变体各编码一次
-    r5:     {use_dis: true,  rife_warp: 0.08, rife_col: 2.0,   depth: any,       min_cc_px: 0}   # 第五轮设置（对照）
-    rife:   {use_dis: false, rife_warp: 0.20, rife_col: 6.0,   depth: near_fail, min_cc_px: 150} # 只用 RIFE 失败信号，深度跳变须挨着失败处
-    strict: {use_dis: false, rife_warp: 0.25, rife_col: 1.0e+9, depth: "off",    min_cc_px: 300} # 只用 |W0-W1|，最保守
+  variants:                             # 每个变体输出 tokens/<setup>/<name>/pair{a}-{b}/（逐对，用于贴回）和并集；GS 只编码一次（gs.token_window）
+    r5:       {use_dis: true,  rife_warp: 0.08, rife_col: 2.0,    depth: any,       min_cc_px: 0}   # 第五轮设置（对照）
+    rife:     {use_dis: false, rife_warp: 0.20, rife_col: 6.0,    depth: near_fail, min_cc_px: 150} # 只用 RIFE 失败信号，深度跳变须挨着失败处
+    strict:   {use_dis: false, rife_warp: 0.25, rife_col: 1.0e+9, depth: "off",    min_cc_px: 300} # 只用 |W0-W1|，最保守
+    rife_g:   {use_dis: false, rife_warp: 0.20, rife_col: 6.0,    depth: near_fail, min_cc_px: 150, pair_gate: 0.03} # rife + 逐对触发门限
+    strict_g: {use_dis: false, rife_warp: 0.25, rife_col: 1.0e+9, depth: "off",    min_cc_px: 300, pair_gate: 0.03} # strict + 逐对触发门限
+  # pair_gate：某相机对的 core 占前景比例（两台相机平均）低于该值时，该对之间的虚拟视点不触发 GS（=纯光流）。
+  # 0.03 是初值（第六轮 cam5 oracle_fail 仅占前景 4.2%）；逐目标表会列出每对的 core 面积，便于事后定门限。
   ring_max_disp_px: 20                  # 环带配准位移超过该值视为不可信，退回直接贴回
   paste_fg_dilate_px: 15                # 贴回只在光流结果前景（绿幕抠像）附近进行，不用真值
 
@@ -65,6 +69,7 @@ gs:
   pose_sources: [aligned_int, aligned_vggt]         # vggt: 目标相机原图域渲染再经 H_k（对照）；aligned_*: 直接在对齐（离轴）域渲染，int=光心按光流同一 t 插值，vggt=光心取 VGGT 估计。interp（第四轮，朝向插值）失败已弃用
   aligned_ref: 4                        # 对齐参考相机（单应 H 近似相似变换的那台，即中心相机）
   aligned_pad_px: 160                   # 对齐域渲染画布四周的余量（平面单应会平移画面）
+  token_window: fixed                   # fixed：所有 token 变体共用一次编码（窗口 = 各变体重建区并集），变体只决定选哪些高斯；per_variant：第六轮做法（每个变体按自己的窗口各编码一次，窗口小时 GS 变差）
   keep_mode: visible                    # 局部高斯：visible=输入相机中深度测试后的可见表面；ray=视线穿过即保留（第四轮，足迹过大）
   visible_tol: 0.03                     # 可见性深度容差（相对）
   renders:                              # 每个 (crop, size) 只编码一次；第二、三轮滤波核差异 <0.1 dB，只保留 nat_dil

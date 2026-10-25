@@ -9,6 +9,7 @@ Outputs: work/eval/metrics.csv, auc.csv, registration.csv, risk_sweep.csv, summa
 """
 import argparse
 import csv
+import re
 import sys
 from collections import defaultdict
 from pathlib import Path
@@ -442,6 +443,13 @@ def write_summary(path, rows, auc_rows, t_rows, gs_rows, reg_rows, sweep_rows, t
                 cells = [f"{fmt(mean(s, r, m, 0))} / {fmt(mean(s, r, m, 2), 4)}"
                          for r in ("fg", "object", "oracle_fail", "rest")]
                 lines.append(f"| {s} | {m} | " + " | ".join(cells) + " |")
+        local_names = sorted({g for _, _, g, _, _ in token_rows})
+
+        def tok_local(s, v):  # exact variant match: "rife" must not pick up "rife_g"
+            pat = re.compile(rf"gs_tok{re.escape(v)}\d+_.*_al_local$")
+            return next((g for g in local_names if pat.match(g) and any(r[0] == s and r[2] == g for r in token_rows)),
+                        None)
+
         if token_report:
             lines += ["", "### Token 变体对比（`_al` 对齐域、光心按 t 插值 = 可部署设置）", "",
                       "输入 core = 输入相机上贴回核心区占前景比例（各输入相机平均）；oracle_fail 面积供对照（真值定义的光流失败区）。", "",
@@ -457,16 +465,40 @@ def write_summary(path, rows, auc_rows, t_rows, gs_rows, reg_rows, sweep_rows, t
                     if s not in per_setup:
                         continue
                     core_in = np.mean([c["core"] for c in per_setup[s].values()])
-                    gv = next((g for (ss, g, _) in pr if ss == s and g.startswith(f"gs_tok{v}") and
-                               g.endswith("_al_local")), None)
+                    gv = tok_local(s, v)
                     if gv is None:
                         continue
                     m = f"hyb_token[{gv}]"
-                    fr = np.mean([x[2] for x in pr[(s, gv, "flow")]]) if pr.get((s, gv, "flow")) else float("nan")
+                    # over all targets, including those whose pair did not trigger (paste area 0)
+                    fr = np.mean([fr for ss, _, g, fr, _ in token_rows if ss == s and g == gv])
                     lines.append(f"| {s} | {v} | {fmt(core_in * 100, 1)}% | {fmt(fr * 100, 1)}% | "
                                  f"{fmt(mean(s, 'fg', m, 0))} / {fmt(mean(s, 'fg', m, 2), 4)} | "
                                  f"{fmt(mean(s, 'object', m, 0))} / {fmt(mean(s, 'object', m, 2), 4)} | "
                                  f"{fmt(mean(s, 'rest', m, 0))} |")
+            per_t = defaultdict(dict)
+            for r in rows:
+                if r[3] == "fg":
+                    per_t[(r[0], int(r[1]))][r[2]] = (r[4], r[6])
+            pairs = token_report.get("pairs", {})
+            names = [v for v in token_report.get("fractions", {})]
+            lines += ["", "### 逐目标视点（fg ΔPSNR / ΔLPIPS 相对纯光流；输入对 core = 该目标所在相机对的 token 面积，"
+                      "带 * 表示该对被门限关闭、等价纯光流）", "",
+                      "| 设置 | 目标 | 相机对 | 光流 fg PSNR / LPIPS | " + " | ".join(names) + " |",
+                      "|---|---|---|---:|" + "---:|" * len(names)]
+            for (s, k) in sorted(per_t):
+                ctx = sorted({int(c) for c in token_report["fractions"][names[0]].get(s, {})}) if names else []
+                if not ctx or ref not in per_t[(s, k)]:
+                    continue
+                a, b = max(c for c in ctx if c < k), min(c for c in ctx if c > k)
+                fp, fl = per_t[(s, k)][ref]
+                cells = []
+                for v in names:
+                    gv = tok_local(s, v)
+                    hv = per_t[(s, k)].get(f"hyb_token[{gv}]") if gv else None
+                    pinfo = pairs.get(v, {}).get(s, {}).get(f"{a}-{b}", {})
+                    tag = f"core {fmt(pinfo.get('core', float('nan')) * 100, 1)}%{'*' if pinfo.get('gated') else ''}"
+                    cells.append(f"{hv[0] - fp:+.2f} / {hv[1] - fl:+.4f} ({tag})" if hv else "—")
+                lines.append(f"| {s} | {k} | {a}-{b} | {fmt(fp)} / {fmt(fl, 4)} | " + " | ".join(cells) + " |")
         lines += ["", "## 其余诊断（整窗口 GS、用真值配准的上限等）", ""]
     def pose_src(m):
         core = m[:-len("_local")] if m.endswith("_local") else m

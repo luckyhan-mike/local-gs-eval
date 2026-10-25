@@ -14,7 +14,37 @@
 
 ---
 
-## 0. 第六轮：收紧 token 检测（当前主实验）
+## 0. 第七轮：逐对 token + 固定编码窗口（当前主实验）
+
+第六轮结论：收紧 token 后 cam3 的 `strict`/`rife` 第一次在 fg 的 PSNR、LPIPS 两项上都优于纯光流（strict 26.31 dB / 0.0558 vs 22.60 / 0.0629）。但逐目标拆开看，**收益全部来自目标 1–3**：
+
+| cam3 目标 | 所在相机对 | 光流 object PSNR / LPIPS | strict object PSNR / LPIPS |
+|---|---|---|---|
+| 1, 2, 3 | 0–4 | 8.5–9.9 / ≈0.45 | 14.3–17.7 / ≈0.20 |
+| 6, 7 | 4–8 | 21.8–22.5 / ≈0.05 | 16.4–18.5 / 0.17–0.20 |
+
+光流的失败是**单侧**的：魔方在 0–4 这一对里严重失败，在 4–8 里基本正确（strict 在 cam0/4/8 的 core 分别为 12.3% / 12.7% / 0.1%）。但第六轮把所有输入相机的 token 取并集，cam4 上由 0–4 检出的魔方 token 也被贴到 4–8 之间的目标上，把清晰正确的光流魔方换成了偏软的 GS 魔方。另一个问题是每个变体按自己的重建区裁剪窗口，token 越少窗口越小：cam5 strict 窗口只有 448 px，AnySplat 输入自渲染掉到 21.2 dB（r5 窗口 917 px 时为 29.5 dB），贴回区内只有 15–17 dB。
+
+第七轮的三处改动：
+
+1. **逐对 token**（`detect_tokens.py`）：每个相机对 (a, b) 只用该对 RIFE t=0.5 的失败信号（以及该对的 DIS 遮挡）标记 a、b 两张图，输出到 `tokens/<setup>/<变体>/pair{a}-{b}/`。a、b 之间的虚拟视点只用这一对的 token 选高斯、算贴回足迹（`run_anysplat.py` 的 `local_keep`）。并集仍写在 `tokens/<setup>/<变体>/`，用于叠加图和编码窗口。
+2. **固定编码窗口**（`gs.token_window: fixed`）：每个设置只编码一次 AnySplat，窗口取所有变体重建区的并集（实际由 r5 决定，约 910 px，自渲染约 29 dB）。各 token 变体共用同一组高斯，只决定选哪些高斯、贴到哪里，所以变体之间是干净的对照。命名：整窗口 `gs_tok448_nat_dil_al`，局部 `gs_tok<变体>448_nat_dil_al_local`。`per_variant` 可恢复第六轮的做法。
+3. **逐对触发门限**（变体 `rife_g` / `strict_g`，`pair_gate: 0.03`）：某对的 core 面积（两台相机的平均值，占前景比例）低于门限时，这一对之间的虚拟视点不触发 GS，等于纯光流。0.03 是初值；`summary.md` 新增的"逐目标视点"表会列出每个目标所在相机对的 core 面积和 ΔPSNR / ΔLPIPS，可以据此事后确定门限。
+
+本地真实数据上的逐对 core（占前景）：
+
+| 设置 | 相机对 | r5 | rife | strict | 门限 0.03 |
+|---|---|---:|---:|---:|---|
+| cam3 | 0–4 | 30.2% | 14.5% | 12.4% | 触发 |
+| cam3 | 4–8 | 25.2% | 2.5% | 0.4% | rife_g / strict_g 关闭 |
+| cam5 | 0–2 | 18.8% | 5.9% | 4.0% | 触发 |
+| cam5 | 2–4 | 13.0% | 3.7% | 2.1% | rife_g 触发，strict_g 关闭 |
+| cam5 | 4–6 | 11.2% | 0.8% | 0.2% | 关闭 |
+| cam5 | 6–8 | 7.1% | 0.4% | 0.0% | 关闭 |
+
+预期：cam3 目标 1–3 保持第六轮的提升，目标 5–7 回到纯光流附近（`*_g` 恰好等于纯光流），6 个目标都不差于光流；cam5 大部分目标等于纯光流，fg 不再低于光流。
+
+## 0.0 第六轮：收紧 token 检测
 
 第五轮结论：对齐域渲染解决了几何错位（cam3 环带位移 0 px），token 贴回第一次超过纯光流（cam3 fg 25.27 vs 22.60 dB，魔方区 16.99 vs 14.53 dB）。但贴回区仍覆盖约 49% 前景，而光流真正失败的区域只有约 12%；其余部分把正确的光流换成更软的 GS，导致 fg LPIPS 和 rest 变差。用同一批 `_al` 高斯只贴 oracle 失败区时 fg 达到 27.03 dB / 0.057（PSNR 与 LPIPS 均优于光流），说明**瓶颈是检测精度**。小基线（cam5）即使完美检测也不如光流，应基本不触发。
 
@@ -175,6 +205,24 @@ cd local-gs-eval && git pull
 HF_HUB_OFFLINE=1 PYTHONUNBUFFERED=1 bash run_all.sh configs/mofang_9cam.yaml
 python -m unittest discover -s tests -v
 ```
+
+**第七轮（复用第六轮的工作目录）**：`prepare`、光流、`poses/` 不变；token 需要重新检测（新增逐对目录），GS 只编码一次：
+
+```bash
+export LGS_WORK_DIR=work/round7
+mkdir -p $LGS_WORK_DIR && cp -r work/round6/{prepare,flow,poses,compat_packages} $LGS_WORK_DIR/
+python scripts/detect_tokens.py --config configs/mofang_9cam.yaml
+python scripts/run_anysplat.py  --config configs/mofang_9cam.yaml
+python scripts/evaluate.py      --config configs/mofang_9cam.yaml
+python scripts/validate_results.py configs/mofang_9cam.yaml
+python -m unittest discover -s tests -v
+```
+
+日志里每对会打印 `pair a-b: core=…`（被门限关闭的会标出 `pure flow`），GS 编码后打印每个变体、每对选中的高斯数量。先看 `summary.md` 的"Token 变体对比"和"逐目标视点"两张表：
+
+- cam3：`rife`/`strict` 的 fg 两项仍优于光流，且目标 5–7 不再变差（object LPIPS 不再从 0.05 升到 0.17+）；
+- cam5：`rife_g`/`strict_g` 的 fg 不低于纯光流，`strict` 不再出现第六轮那样的 −4 dB；
+- 固定窗口下输入自渲染 PSNR 应在 29 dB 左右（AnySplat 统计表）。
 
 **第六轮（复用第五轮的工作目录）**：`prepare`、光流、`poses/` 不变；token 需要重新检测（新的变体目录结构）：
 

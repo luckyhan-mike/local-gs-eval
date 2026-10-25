@@ -8,6 +8,13 @@ Outputs per setup/variant (aligned image domain, comparable to RIFE results and 
 work/poses/<setup>.json holds the t shared with run_flow.py; it is written by the first encode only if absent.
 With work/tokens/<setup> present (detect_tokens.py), each render also gets a *_local variant: only the
 Gaussians inside the token reconstruction region, plus cam{k}_alpha_core.png = footprint of the token core.
+
+Round 7: the token crop is encoded once with a fixed window (union of every token variant's
+reconstruction region, gs.token_window: fixed), so all token variants share the same Gaussians and only
+select different subsets (gs_tok<size>_* = full render, gs_tok<variant><size>_*_local = that variant's
+local render). The local Gaussians of a target between context cameras a and b come from the tokens
+detected in pair (a, b) only. gs.token_window: per_variant restores the round-6 behaviour (one encode
+per variant with its own window).
 """
 import argparse
 import sys
@@ -152,7 +159,8 @@ def aligned_setup(runner, state, ctx, targets, win, hs, gcfg, shared_t, aligned_
 
 def render_aligned(runner, state, al, src, keep, kw):
     """Off-axis views in the flow (aligned) domain: reference rotation/intrinsics at each target
-    centre, then the zero-parallax-plane homography. Returns [(rgb, alpha, valid)] per target."""
+    centre, then the zero-parallax-plane homography. `keep` is None, one mask, or one mask per target.
+    Returns [(rgb, alpha, valid)] per target."""
     h, w = al["shape"]
     p = al["pad"]
     K = al["K_al"].copy()
@@ -160,10 +168,11 @@ def render_aligned(runner, state, al, src, keep, kw):
     K[1, 2] += p
     shift = np.array([[1, 0, -p], [0, 1, -p], [0, 0, 1.0]])
     out = []
-    for c in al["centers"][src]:
+    for i, c in enumerate(al["centers"][src]):
         cam = al["c2w_al"].copy()
         cam[:3, 3] = c
-        rgb, alpha, _ = runner.render_px(state, cam[None], K[None], w + 2 * p, h + 2 * p, keep=keep, **kw)
+        kp = keep[i] if isinstance(keep, list) else keep
+        rgb, alpha, _ = runner.render_px(state, cam[None], K[None], w + 2 * p, h + 2 * p, keep=kp, **kw)
         G = plane_homography(al["K_al"], al["c2w_al"], c, al["n"], al["d"], (w, h)) @ shift
         img = cv2.warpPerspective(rgb[0], G, (w, h), flags=cv2.INTER_LINEAR)
         a = cv2.warpPerspective(alpha[0], G, (w, h), flags=cv2.INTER_LINEAR)
@@ -174,14 +183,25 @@ def render_aligned(runner, state, al, src, keep, kw):
 
 
 def load_token_sets(tok_root, ctx, tcfg):
-    """{variant: {"core": [raw masks], "recon": [raw masks]}} from detect_tokens.py output.
+    """{variant: {"core": [raw masks], "recon": [raw masks], "pairs": {(a, b): {"core": [...], "recon": [...]}}}}
+    from detect_tokens.py output; per-pair lists hold one mask per context camera (empty off the pair).
 
-    Supports the round-6 layout tokens/<setup>/<variant>/ and the older flat tokens/<setup>/."""
+    Supports the round-7 layout (with pair*/), round 6 tokens/<setup>/<variant>/ and the flat tokens/<setup>/."""
     if not tok_root.exists():
         return {}
 
     def load(d):
-        return {kind: [read_mask(d / f"cam{k}_{kind}_raw.png") for k in ctx] for kind in ("core", "recon")}
+        out = {kind: [read_mask(d / f"cam{k}_{kind}_raw.png") for k in ctx] for kind in ("core", "recon")}
+        pairs = {}
+        for a, b in zip(ctx[:-1], ctx[1:]):
+            pd = d / f"pair{a}-{b}"
+            if not pd.is_dir():
+                continue
+            empty = np.zeros_like(out["core"][0])
+            pairs[(a, b)] = {kind: [read_mask(pd / f"cam{k}_{kind}_raw.png") if k in (a, b) else empty
+                                    for k in ctx] for kind in ("core", "recon")}
+        out["pairs"] = pairs
+        return out
 
     names = [v for v in (tcfg.get("variants") or {}) if (tok_root / v).is_dir()]
     if names:
@@ -189,6 +209,31 @@ def load_token_sets(tok_root, ctx, tcfg):
     if (tok_root / f"cam{ctx[0]}_core_raw.png").exists():
         return {"flat": load(tok_root)}
     return {}
+
+
+def local_keep(runner, state, tokens, win, size, ctx, targets, gcfg, depth):
+    """Per-target (recon, core) keep masks. With per-pair tokens a target between a and b keeps only the
+    Gaussians selected by pair (a, b); otherwise every target uses the union over all context cameras."""
+    x0, y0, side = win
+
+    def sel(mask_list):
+        masks = [cv2.resize(m[y0:y0 + side, x0:x0 + side].astype(np.uint8), (size, size),
+                            interpolation=cv2.INTER_NEAREST) > 0 for m in mask_list]
+        if not any(m.any() for m in masks):
+            return np.zeros(len(state["gaussians"].means[0]), bool)
+        if gcfg.get("keep_mode", "visible") == "visible":
+            return runner.visible_keep(state, masks, gcfg.get("visible_tol", 0.03), depth=depth).cpu().numpy()
+        return token_keep(state["gaussians"].means[0], state["ctx_c2w"], state["ctx_intr"], masks).cpu().numpy()
+
+    if tokens.get("pairs"):
+        by_pair = {pr: (sel(m["recon"]), sel(m["core"])) for pr, m in tokens["pairs"].items()}
+        per_t = [by_pair[neighbors(ctx, k)] for k in targets]
+        counts = {f"{a}-{b}": {"recon": int(r.sum()), "core": int(c.sum())} for (a, b), (r, c) in by_pair.items()}
+    else:
+        both = (sel(tokens["recon"]), sel(tokens["core"]))
+        per_t = [both] * len(targets)
+        counts = {"all": {"recon": int(both[0].sum()), "core": int(both[1].sum())}}
+    return [r for r, _ in per_t], [c for _, c in per_t], counts
 
 
 def rig_positions(c2w_by_cam, ctx):
@@ -237,22 +282,32 @@ def main():
         # Shared t with the flow branch: reuse the existing pose file (e.g. copied from round 2) if present.
         pose_file = work / "poses" / f"{setup}.json"
         shared_t = {int(k): v for k, v in load_json(pose_file)["t_pose"].items()} if pose_file.exists() else None
-        # A token crop is encoded once per token variant (its window is that variant's recon bbox);
-        # other crops use the primary variant's masks for their local Gaussians.
-        jobs = []
+        # token crop, fixed window (default): one encode whose window covers every variant's recon region;
+        # each variant only selects its own local Gaussians -> label "tok", locals "tok<variant>".
+        # token crop, per_variant (round 6): one encode per variant with that variant's own window.
+        # Other crops use the primary variant's masks for their local Gaussians.
+        jobs = []  # (crop, label, window masks, {local label: (variant, token set)})
         for crop in crops:
             if crop == "token" and token_sets:
+                live = {}
                 for v, ts in token_sets.items():
                     if any(m.any() for m in ts["recon"]):
-                        jobs.append((crop, f"tok{v}", v, ts))
+                        live[v] = ts
                     else:
                         print(f"[{setup}] token 变体 {v} 在所有输入相机上都没有标记：不触发 GS，等价于纯光流")
+                if not live:
+                    continue
+                if gcfg.get("token_window", "fixed") == "fixed":
+                    union = [np.logical_or.reduce([ts["recon"][i] for ts in live.values()]) for i in range(len(ctx))]
+                    jobs.append((crop, "tok", union, {f"tok{v}": (v, ts) for v, ts in live.items()}))
+                else:
+                    jobs += [(crop, f"tok{v}", ts["recon"], {f"tok{v}": (v, ts)}) for v, ts in live.items()]
             else:
                 prim = token_sets.get(tcfg.get("primary")) if token_sets else None
-                jobs.append((crop, crop, tcfg.get("primary") if prim else None, prim))
-        for crop, label, tok_variant, tokens in jobs:
+                jobs.append((crop, crop, None, {crop: (tcfg.get("primary"), prim)} if prim else {}))
+        for crop, label, win_masks, locals_ in jobs:
             win = crop_window(crop, raw_shape, [raws[k] for k in ctx], fg_ctx, gcfg, cfg["chroma"],
-                              tokens["recon"] if tokens else None, tcfg.get("crop_pad_px", 0))
+                              win_masks, tcfg.get("crop_pad_px", 0))
             x0, y0, side = win
             for size in sizes:
                 assert size % 14 == 0, "AnySplat/VGGT 需要 14 的倍数"
@@ -286,19 +341,14 @@ def main():
                 print("  t_pose (this encode):", {k: round(v, 3) for k, v in t_pose.items()},
                       " t shared with flow:", {k: round(shared_t[k], 3) for k in targets})
 
-                keep = {}
-                if tokens:
-                    for kind in ("core", "recon"):
-                        masks = [cv2.resize(m[y0:y0 + side, x0:x0 + side].astype(np.uint8), (size, size),
-                                            interpolation=cv2.INTER_NEAREST) > 0 for m in tokens[kind]]
-                        if gcfg.get("keep_mode", "visible") == "visible":
-                            keep[kind] = runner.visible_keep(state, masks, gcfg.get("visible_tol", 0.03))
-                        else:
-                            keep[kind] = token_keep(state["gaussians"].means[0], state["ctx_c2w"],
-                                                    state["ctx_intr"], masks)
-                    diag["local_gaussians"] = {kind: int(v.sum()) for kind, v in keep.items()}
-                    print(f"  local GS ({gcfg.get('keep_mode', 'visible')}): recon={diag['local_gaussians']['recon']}"
-                          f" core={diag['local_gaussians']['core']} of {diag['num_gaussians']} Gaussians")
+                keeps, local_counts = {}, {}
+                depth = runner.ctx_depth(state) if locals_ else None
+                for lab, (tv, ts) in locals_.items():
+                    kr, kc, counts = local_keep(runner, state, ts, win, size, ctx, targets, gcfg, depth)
+                    keeps[lab] = (tv, kr, kc)
+                    local_counts[lab] = counts
+                    print(f"  local GS {lab} ({gcfg.get('keep_mode', 'visible')}, of {diag['num_gaussians']}): "
+                          + ", ".join(f"{pr} recon={c['recon']} core={c['core']}" for pr, c in counts.items()))
 
                 # Camera-domain sources render the raw target view and warp it with that camera's H.
                 sources = [s for s in gcfg["pose_sources"] if not s.startswith("aligned")]
@@ -328,12 +378,12 @@ def main():
                             eps2d = 0.3 * scale ** 2
                         kw = dict(mode=rv["mode"], eps2d=eps2d, filter3d=rv["filter3d"],
                                   filter3d_var=gcfg["filter3d_var"], filter3d_comp=gcfg.get("filter3d_comp", False))
-                        name = f"{base}_{rv['name']}{POSE_SUFFIX[src]}"
+                        tail = f"{size}_{rv['name']}{POSE_SUFFIX[src]}"
                         # full: all Gaussians of the crop; local: only the token reconstruction region
-                        outputs = {name: (None, None)}
-                        if keep:
-                            outputs[f"{name}_local"] = (keep["recon"], keep["core"])
-                        for variant, (kp, kp_core) in outputs.items():
+                        outputs = {f"{base}_{rv['name']}{POSE_SUFFIX[src]}": (None, None, None, None)}
+                        for lab, (tv, kr, kc) in keeps.items():
+                            outputs[f"gs_{lab}{tail}_local"] = (tv, kr, kc, local_counts[lab])
+                        for variant, (tok_variant, kp, kp_core, counts) in outputs.items():
                             out = work / "gs" / setup / variant
                             t0 = time.time()
                             if src.startswith("aligned"):
@@ -341,19 +391,21 @@ def main():
                                 cores = render_aligned(runner, state, al, src, kp_core, kw) if kp_core is not None \
                                     else None
                             else:
-                                rgb, alpha = runner.render(state, tgt_c2w, tgt_intr, res, keep=kp, **kw)
-                                acore = runner.render(state, tgt_c2w, tgt_intr, res, keep=kp_core, **kw)[1] \
-                                    if kp_core is not None else None
                                 views = []
-                                cores = [] if acore is not None else None
+                                cores = [] if kp_core is not None else None
                                 for i, k in enumerate(targets):
+                                    sl = slice(i, i + 1)
+                                    rgb, alpha = runner.render(state, tgt_c2w[sl], tgt_intr[sl], res,
+                                                               keep=kp[i] if kp is not None else None, **kw)
                                     dmap = None
                                     if use_dist:
                                         dmap = dmaps.setdefault(k, distort_maps(rig[k]["K"], rig[k]["dist"], raw_shape))
-                                    views.append(paste_and_warp(rgb[i], alpha[i], win, raw_shape, hs[k],
+                                    views.append(paste_and_warp(rgb[0], alpha[0], win, raw_shape, hs[k],
                                                                 aligned_shape, dmap))
-                                    if acore is not None:
-                                        cores.append(paste_and_warp(rgb[i], acore[i], win, raw_shape, hs[k],
+                                    if kp_core is not None:
+                                        acore = runner.render(state, tgt_c2w[sl], tgt_intr[sl], res, keep=kp_core[i],
+                                                              **kw)[1]
+                                        cores.append(paste_and_warp(rgb[0], acore[0], win, raw_shape, hs[k],
                                                                     aligned_shape, dmap))
                             t_render = (time.time() - t0) / len(targets)
                             for i, k in enumerate(targets):
@@ -364,7 +416,8 @@ def main():
                                 if cores is not None:
                                     imwrite(out / f"cam{k}_alpha_core.png", np.clip(cores[i][1], 0, 1))
                             meta = dict(diag, window=list(win), size=size, crop=crop, token_variant=tok_variant,
-                                        render=rv, render_res=res,
+                                        token_window=gcfg.get("token_window", "fixed") if crop == "token" else None,
+                                        local_gaussians=counts, render=rv, render_res=res,
                                         eps2d_used=float(eps2d), time_render_per_view_s=t_render, pose_source=src,
                                         pose_diag=pdiag, local=kp is not None)
                             save_json(out / "meta.json", meta)

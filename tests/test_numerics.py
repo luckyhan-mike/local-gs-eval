@@ -173,6 +173,40 @@ class NumericsTests(unittest.TestCase):
         exp = cv2.perspectiveTransform(project(cams[2][0], cams[2][1], Y)[0][None], hs[2])[0, 0]
         self.assertLess(np.hypot(u - exp[0], v - exp[1]), 1.5)
 
+    def test_local_keep_uses_only_the_targets_pair(self):
+        import tempfile
+        import torch
+        from pathlib import Path
+        from lgs.common import write_mask
+        from scripts.run_anysplat import load_token_sets, local_keep
+        ctx, targets = [0, 4, 8], [2, 6]
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d) / "rife"
+            mark = np.zeros((40, 40), bool)
+            mark[10:20, 10:20] = True
+            for k in ctx:  # union: cam0 and cam4 marked; pair 0-4 marks both, pair 4-8 marks nothing
+                for kind in ("core", "recon"):
+                    write_mask(root / f"cam{k}_{kind}_raw.png", mark if k != 8 else np.zeros_like(mark))
+            for (a, b), m in (((0, 4), mark), ((4, 8), np.zeros_like(mark))):
+                for k in (a, b):
+                    for kind in ("core", "recon"):
+                        write_mask(root / f"pair{a}-{b}" / f"cam{k}_{kind}_raw.png", m)
+            ts = load_token_sets(Path(d), ctx, {"variants": {"rife": {}}})["rife"]
+        self.assertEqual(set(ts["pairs"]), {(0, 4), (4, 8)})
+
+        class Gs:  # one Gaussian per context camera, seen only by that camera
+            means = [torch.zeros(3, 3)]
+
+        class MockRunner:
+            def visible_keep(self, state, masks, tol, depth=None):
+                return torch.tensor([m.any() for m in masks])
+
+        kr, kc, counts = local_keep(MockRunner(), {"gaussians": Gs()}, ts, (0, 0, 40), 40, ctx, targets,
+                                    {"keep_mode": "visible"}, None)
+        np.testing.assert_array_equal(kr[0], [True, True, False])   # target 2: pair 0-4
+        np.testing.assert_array_equal(kc[1], [False, False, False])  # target 6: pair 4-8 has no tokens
+        self.assertEqual(counts["4-8"]["core"], 0)
+
     def test_target_poses_calib_identity_frame(self):
         from scripts.run_anysplat import target_poses
         c2w = np.repeat(np.eye(4)[None], 4, 0)

@@ -39,11 +39,17 @@ def main():
         tok_root = work / "tokens" / setup
         tok_vars = [v for v in (cfg.get("tokens", {}).get("variants") or {}) if (tok_root / v).is_dir()]
         labels = [f"tok{v}" for v in tok_vars] if tok_vars else ["token"]
-        crop_labels = [lab for crop in gcfg["crops"] for lab in (labels if crop == "token" else [crop])]
-        variants = [f"gs_{lab}{size}_{rv['name']}{suffix[src]}" for lab in crop_labels for size in gcfg["sizes"]
-                    for rv in gcfg["renders"] for src in gcfg.get("pose_sources", ["vggt"])]
-        if (work / "tokens" / setup).exists():
-            variants += [v + "_local" for v in variants]
+        fixed = gcfg.get("token_window", "fixed") == "fixed" and tok_vars
+        tails = [f"{size}_{rv['name']}{suffix[src]}" for size in gcfg["sizes"] for rv in gcfg["renders"]
+                 for src in gcfg.get("pose_sources", ["vggt"])]
+        variants = []
+        for crop in gcfg["crops"]:
+            if crop == "token" and fixed:  # one encode: full render gs_tok*, one local render per token variant
+                variants += [f"gs_tok{t}" for t in tails]
+                variants += [f"gs_{lab}{t}_local" for lab in labels for t in tails]
+            else:
+                full = [f"gs_{lab}{t}" for lab in (labels if crop == "token" else [crop]) for t in tails]
+                variants += full + ([v + "_local" for v in full] if tok_root.exists() else [])
         for variant in variants:
             folder = work / "gs" / setup / variant
             meta = load_json(folder / "meta.json")

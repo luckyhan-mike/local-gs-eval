@@ -175,6 +175,11 @@ class AnySplatRunner:
         feat = g.harmonics[0].permute(0, 2, 1).float().contiguous()  # N,K,3
         if keep is not None:
             keep = torch.as_tensor(keep, device=means.device)
+            if not bool(keep.any()):  # nothing selected (e.g. a gated pair): empty, fully transparent views
+                v = len(c2w)
+                return (np.zeros((v, int(height), int(width), 3), np.float32),
+                        np.zeros((v, int(height), int(width)), np.float32),
+                        np.zeros((v, int(height), int(width)), np.float32) if depth else None)
             means, cov, op, quats, scales, feat = (x[keep] for x in (means, cov, op, quats, scales, feat))
         if filter3d:
             cov, op, _ = mip_filter3d(means, cov, op, state["ctx_c2w"], state["ctx_intr"],
@@ -196,8 +201,16 @@ class AnySplatRunner:
                 depths.append(out[0, ..., 3].cpu().numpy())
         return np.stack(colors), np.stack(alphas), (np.stack(depths) if depth else None)
 
+    def ctx_depth(self, state):
+        """Expected depth of every context camera at the input resolution (for visible_keep)."""
+        size = state["size"]
+        K = np.array(state["ctx_intr"], np.float64).copy()
+        K[:, 0] *= size
+        K[:, 1] *= size
+        return self.render_px(state, state["ctx_c2w"], K, size, size, depth=True)[2]
+
     @torch.no_grad()
-    def visible_keep(self, state, masks, tol=0.03):
+    def visible_keep(self, state, masks, tol=0.03, depth=None):
         """Gaussians on the visible surface inside each context camera's token mask (depth-tested).
 
         A Gaussian is kept if its centre projects into the mask of some context camera and lies within
@@ -210,7 +223,8 @@ class AnySplatRunner:
         K = np.array(state["ctx_intr"], np.float64).copy()
         K[:, 0] *= size
         K[:, 1] *= size
-        _, _, depth = self.render_px(state, state["ctx_c2w"], K, size, size, depth=True)
+        if depth is None:
+            depth = self.ctx_depth(state)
         means = state["gaussians"].means[0].float()
         keep = torch.zeros(len(means), dtype=torch.bool, device=means.device)
         for c2w, k, m, dmap in zip(state["ctx_c2w"], K, masks, depth):

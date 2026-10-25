@@ -8,6 +8,9 @@ Temporary detector until experiment 1 settles. For each adjacent context pair (a
   * optional DIS source-to-source flow for an occlusion check (forward-backward AND photometric
     inconsistency). RIFE cannot provide source-to-source flow: at t=0 its fusion mask is 1, so
     F_t->1 is unsupervised there and comes out far too short.
+Tokens are kept per context pair (round 7): a virtual view between a and b is synthesised from a and b
+only, so it may only use the failures detected in that pair. In round 6 the union over all pairs let
+cam4 tokens found by pair 0-4 replace a correct flow result between 4 and 8.
 Every entry of `tokens.variants` recombines these signals with its own thresholds:
   fail   RIFE failure (r_warp > rife_warp or r_col > rife_col) [+ DIS occlusion if use_dis];
          connected components smaller than min_cc_px dropped
@@ -15,9 +18,12 @@ Every entry of `tokens.variants` recombines these signals with its own threshold
          pixel, i.e. a depth jump where the flow actually breaks) | off
   core   (fail | depth) dilated by core_dilate_px      -> region pasted back from GS
   recon  core dilated by recon_margin_px                -> region whose Gaussians are kept
+  pair_gate  if the pair's core covers less than this fraction of the foreground (mean over its two
+         cameras) the pair does not trigger GS at all: its views stay pure flow (small baselines)
 Round 5 showed GS only helps where the flow really fails (perfect detector: +4.4 dB fg on cam3) and
 hurts where the flow is right, so the variants trade recall for precision.
-Outputs work/tokens/<setup>/<variant>/cam{k}_{fail,depth,core,recon}{,_raw}.png, overlays, tokens.json
+Outputs work/tokens/<setup>/<variant>/pair{a}-{b}/cam{k}_{fail,depth,core,recon}{,_raw}.png (used for
+paste-back), the union over pairs in work/tokens/<setup>/<variant>/ (overlays, encoding window), tokens.json
 """
 import argparse
 import sys
@@ -81,7 +87,7 @@ def drop_small(m, min_px):
 
 def variant_params(tcfg, name):
     p = {"use_dis": False, "rife_warp": 0.20, "rife_col": 6.0, "depth": "near_fail", "near_fail_px": 12,
-         "min_cc_px": 150, "depth_thresh": tcfg["depth_thresh"]}
+         "min_cc_px": 150, "depth_thresh": tcfg["depth_thresh"], "pair_gate": 0.0}
     p.update(tcfg["variants"][name] or {})
     return p
 
@@ -99,69 +105,87 @@ def main():
     variants = {v: variant_params(tcfg, v) for v in tcfg["variants"]}
     need_dis = any(p["use_dis"] for p in variants.values())
     report = {v: {} for v in variants}
+    pair_report = {v: {} for v in variants}
     for setup in args.setups or list(cfg["setups"]):
         ctx, _ = setup_cams(cfg, setup)
         u8 = {k: imread_rgb(cam_path(cfg, "aligned", k)) for k in ctx}
         img = {k: u8[k].astype(np.float32) / 255.0 for k in ctx}
         raw_shape = imread_rgb(cam_path(cfg, "raw", ctx[0])).shape[:2]
         shape = u8[ctx[0]].shape[:2]
-        occl = {k: np.zeros(shape, bool) for k in ctx}
-        mids = []  # per pair: (a, b, signals, flow, near-foreground mask)
+        mids = []  # per pair: (a, b, signals, flow, near-foreground mask, DIS occlusion {a, b})
         for a, b in zip(ctx[:-1], ctx[1:]):
+            occl = {a: np.zeros(shape, bool), b: np.zeros(shape, bool)}
             if need_dis:
                 f_ab = dis_flow(u8[a], u8[b], tcfg["dis_preset"])
                 f_ba = dis_flow(u8[b], u8[a], tcfg["dis_preset"])
-                occl[a] |= pair_occlusion(img[a], img[b], f_ab, f_ba, tcfg)
-                occl[b] |= pair_occlusion(img[b], img[a], f_ba, f_ab, tcfg)
+                occl[a] = pair_occlusion(img[a], img[b], f_ab, f_ba, tcfg)
+                occl[b] = pair_occlusion(img[b], img[a], f_ba, f_ab, tcfg)
             mid = rife.synth(u8[a], u8[b], 0.5, tcfg["rife_scale"])
             s = signals(mid, 0.5)
             near_mid = dilate(chroma_fg(mid["pred"], ck), tcfg["fg_dilate_px"])
-            mids.append((a, b, {n: s[n] for n in ("r_warp", "r_col", "g_disp")}, mid["flow"], near_mid))
+            mids.append((a, b, {n: s[n] for n in ("r_warp", "r_col", "g_disp")}, mid["flow"], near_mid, occl))
             print(f"[{setup}] pair {a}-{b}: RIFE t=0.5 |W0-W1|>0.2 on {((s['r_warp'] > 0.2) & near_mid).mean():.4f} "
                   f"of frame, median |F_t0| = {np.median(np.linalg.norm(mid['flow'][..., :2], axis=-1)[near_mid]):.1f}px")
         fgs = {k: read_mask(work / "prepare" / f"fg_aligned_{k:02d}.png") for k in ctx}
+        near = {k: dilate(fgs[k] | chroma_fg(u8[k], ck), tcfg["fg_dilate_px"]) for k in ctx}
+
+        def save(out, k, masks):
+            hinv = np.linalg.inv(hs[k])
+            for name, m in masks.items():
+                write_mask(out / f"cam{k}_{name}.png", m)
+                raw = cv2.warpPerspective(m.astype(np.uint8), hinv, raw_shape[::-1], flags=cv2.INTER_NEAREST) > 0
+                write_mask(out / f"cam{k}_{name}_raw.png", raw)
+
+        def frac(m, k):
+            return float((m & fgs[k]).sum() / max(fgs[k].sum(), 1))
+
         for v, p in variants.items():
             out = work / "tokens" / setup / v
-            rife_fail = {k: np.zeros(shape, bool) for k in ctx}
-            depth_src = {k: np.zeros(shape, bool) for k in ctx}
-            for a, b, s, flow, near_mid in mids:
+            union = {k: {n: np.zeros(shape, bool) for n in ("fail", "depth", "core", "recon")} for k in ctx}
+            pairs = {}
+            for a, b, s, flow, near_mid, occl in mids:
                 bad = ((s["r_warp"] > p["rife_warp"]) | (s["r_col"] > p["rife_col"])) & near_mid
                 edge = (s["g_disp"] > p["depth_thresh"]) & near_mid
+                pm = {}
                 for src, ch in ((a, slice(0, 2)), (b, slice(2, 4))):
-                    rife_fail[src] |= splat(bad, flow[..., ch], shape)
-                    depth_src[src] |= splat(edge, flow[..., ch], shape)
+                    fail = splat(bad, flow[..., ch], shape) | (occl[src] if p["use_dis"] else False)
+                    fail = drop_small(fail & near[src], p["min_cc_px"])
+                    depth = splat(edge, flow[..., ch], shape) & near[src]
+                    if p["depth"] == "near_fail":
+                        depth &= dilate(fail, p["near_fail_px"])
+                    elif p["depth"] in ("off", False, None):  # YAML reads a bare off as False
+                        depth[:] = False
+                    core = dilate(fail | depth, tcfg["core_dilate_px"]) & near[src]
+                    pm[src] = {"fail": fail, "depth": depth, "core": core,
+                               "recon": dilate(core, tcfg["recon_margin_px"])}
+                core_frac = float(np.mean([frac(pm[k]["core"], k) for k in (a, b)]))
+                gated = core_frac < p["pair_gate"]
+                pairs[f"{a}-{b}"] = {"core": core_frac, "gated": bool(gated),
+                                     **{f"core_cam{k}": frac(pm[k]["core"], k) for k in (a, b)}}
+                for k in (a, b):
+                    if gated:
+                        pm[k] = {n: np.zeros(shape, bool) for n in pm[k]}
+                    save(out / f"pair{a}-{b}", k, pm[k])
+                    for n in union[k]:
+                        union[k][n] |= pm[k][n]
+                print(f"[{setup}/{v}] pair {a}-{b}: core={core_frac:.3f} of foreground"
+                      + (f" < gate {p['pair_gate']}: pure flow" if gated else ""))
             report[v][setup] = {}
+            pair_report[v][setup] = pairs
             for k in ctx:
-                fg = fgs[k]
-                near = dilate(fg | chroma_fg(u8[k], ck), tcfg["fg_dilate_px"])
-                fail = (rife_fail[k] | (occl[k] if p["use_dis"] else False)) & near
-                fail = drop_small(fail, p["min_cc_px"])
-                depth = depth_src[k] & near
-                if p["depth"] == "near_fail":
-                    depth &= dilate(fail, p["near_fail_px"])
-                elif p["depth"] in ("off", False, None):  # YAML reads a bare off as False
-                    depth[:] = False
-                core = dilate(fail | depth, tcfg["core_dilate_px"]) & near
-                recon = dilate(core, tcfg["recon_margin_px"])
-                hinv = np.linalg.inv(hs[k])
-                masks = {"fail": fail, "depth": depth, "core": core, "recon": recon}
-                for name, m in masks.items():
-                    write_mask(out / f"cam{k}_{name}.png", m)
-                    raw = cv2.warpPerspective(m.astype(np.uint8), hinv, raw_shape[::-1], flags=cv2.INTER_NEAREST) > 0
-                    write_mask(out / f"cam{k}_{name}_raw.png", raw)
+                masks = union[k]
+                save(out, k, masks)
+                fail, depth, recon = masks["fail"], masks["depth"], masks["recon"]
                 ov = img[k].copy()
                 ov[recon] = 0.7 * ov[recon] + 0.3 * np.array([0, 0.4, 1.0], np.float32)
                 ov[fail] = 0.4 * ov[fail] + 0.6 * np.array([1, 0, 0], np.float32)
                 ov[depth & ~fail] = 0.4 * ov[depth & ~fail] + 0.6 * np.array([1, 1, 0], np.float32)
                 imwrite(out / f"cam{k}_overlay.png", ov[::2, ::2])
-                nfg = max(fg.sum(), 1)
-                r = {name: float((m & fg).sum() / nfg) for name, m in masks.items()}
-                r["occlusion_dis"] = float((occl[k] & near & fg).sum() / nfg) if p["use_dis"] else 0.0
-                r["rife_fail"] = float((rife_fail[k] & near & fg).sum() / nfg)
+                r = {name: frac(m, k) for name, m in masks.items()}
                 report[v][setup][k] = r
-                print(f"[{setup}/{v}] cam{k}: fail={r['fail']:.3f} depth={r['depth']:.3f} core={r['core']:.3f} "
-                      f"recon={r['recon']:.3f} (fraction of foreground)")
-    save_json(work / "tokens" / "tokens.json", {"variants": variants, "fractions": report})
+                print(f"[{setup}/{v}] cam{k} (union over pairs): fail={r['fail']:.3f} depth={r['depth']:.3f} "
+                      f"core={r['core']:.3f} recon={r['recon']:.3f} (fraction of foreground)")
+    save_json(work / "tokens" / "tokens.json", {"variants": variants, "fractions": report, "pairs": pair_report})
 
 
 if __name__ == "__main__":
