@@ -27,7 +27,7 @@ DATA_ROOT=${LGS_DATA_ROOT:-/home/han/linux-han}
 for s in changjing/shot_0007 changjing/shot_0003 changjing1/shot_0012 changjing1/shot_0032 changjing2/shot_0000; do
   for v in 0 1 2 3 4 5; do test -f "$DATA_ROOT/datasets/$s/view_$v.png" || echo "缺少 $DATA_ROOT/datasets/$s/view_$v.png"; done
 done
-test -f "$DATA_ROOT/datasets_1080/calib/homographies_cam3_raw2304_to_crop1920x1088.npy" || echo "缺少单应矩阵"
+test -f "$DATA_ROOT/datasets_1080/calib/homographies_cam3_raw2304_to_crop1920x1088_halfpx.npy" || echo "缺少单应矩阵"
 test -f "$DATA_ROOT/datasets_1080/calib/calib_1920x1080.json" || echo "缺少标定 json"
 test -f "$DATA_ROOT/Practical-RIFE/train_log/flownet.pkl" || echo "缺少 RIFE 权重"
 test -f "$DATA_ROOT/Practical-RIFE/train_log/IFNet_HDv3.py" || echo "缺少 RIFE 网络定义"
@@ -116,7 +116,7 @@ python scripts/run_scenes.py --config configs/dataset6_lean.yaml 2>&1 | tee work
 - `changjing2/shot_0000`：人离相机很近
 
 **和魔方数据的差别（都写在配置里）**：
-- **对齐图**：和 video-tell 的几何一致（见 `datasets_1080/README.md` 第 6 节）。`prepare.py` 在 **2304×1296 原图**上以 cam3 为参考做单应对齐，再中心裁出 **1920×1088**，用的矩阵是 `homographies_cam3_raw2304_to_crop1920x1088.npy`。
+- **对齐图**：和 video-tell 的几何一致（见 `datasets_1080/README.md` 第 6 节）。`prepare.py` 在 **2304×1296 原图**上以 cam3 为参考做单应对齐，再中心裁出 **1920×1088**，用的矩阵是 `homographies_cam3_raw2304_to_crop1920x1088_halfpx.npy`：6 路的裁剪窗口一起平移半个像素，让 cam3 也经过一次重采样。否则 cam3 只是整数平移、没有插值，会比其他几路更锐，人为抬高光流的失败率（见 `datasets_1080/README.md`）。
   - 不先缩小，像素尺度与原图相同；cam0、cam1 只有约 0.3% 的黑边。
   - cam3 是输入相机，`H_3` 只是平移裁剪，所以对齐域相机不会出现斜切。
   - 没有去畸变。

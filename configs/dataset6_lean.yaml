@@ -8,7 +8,7 @@ work_dir: work                          # 输出目录（相对于本仓库根�
 num_cams: 6
 raw_pattern: "datasets/<scene>/<shot>/view_{}.png"        # 2304x1296 原图（AnySplat 输入，未去畸变）
 aligned_pattern: "<work>/aligned/aligned_{:02d}.png"     # prepare.py 用标定单应矩阵生成（光流输入/真值）
-homographies: datasets_1080/calib/homographies_cam3_raw2304_to_crop1920x1088.npy   # 2304 原图上以 cam3 为参考对齐，再中心裁出 1920x1088（与 video-tell 几何一致，不先缩小）
+homographies: datasets_1080/calib/homographies_cam3_raw2304_to_crop1920x1088_halfpx.npy   # 2304 原图上以 cam3 为参考对齐，再中心裁出 1920x1088；6 路一起平移半像素，cam3 也经重采样，锐度一致
 aligned_size: [1920, 1088]
 
 dataset6:
