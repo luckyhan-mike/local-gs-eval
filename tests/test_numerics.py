@@ -297,6 +297,42 @@ class NumericsTests(unittest.TestCase):
         self.assertLess(np.abs(img - exp)[m].mean(), 0.02)
         self.assertGreater(stats[0]["seen_by_both"], 0.3)
 
+    def test_tto_factor_roundtrip_and_local_update(self):
+        import torch
+        from types import SimpleNamespace
+        from lgs.tto import cov_factor, cov_from, optimize
+        rng = np.random.default_rng(0)
+        n = 6
+        R = torch.linalg.qr(torch.as_tensor(rng.normal(size=(n, 3, 3)), dtype=torch.float32))[0]
+        s = torch.as_tensor(rng.uniform(0.01, 0.1, size=(n, 3)), dtype=torch.float32)
+        s[0, 2] = 0.0  # flat surfel, as AnySplat predicts many
+        cov = R @ torch.diag_embed(s ** 2) @ R.transpose(-1, -2)
+        back = cov_from(cov_factor(cov), torch.zeros(n, 3, 3))
+        self.assertLess(float((back - cov).abs().max() / cov.abs().max()), 1e-4)
+
+        g = SimpleNamespace(means=torch.zeros(1, n, 3), covariances=cov[None], opacities=torch.full((1, n), 0.5),
+                            rotations=torch.zeros(1, n, 4), scales=s[None],
+                            harmonics=torch.as_tensor(rng.uniform(0, 1, size=(1, n, 3, 1)), dtype=torch.float32))
+
+        class MockRunner:  # differentiable stand-in for gsplat: opacity-weighted mean colour everywhere
+            device = "cpu"
+            model = SimpleNamespace(decoder=SimpleNamespace(background_color=torch.zeros(3)))
+
+            def rasterization(self, means, quats, scales, op, feat, viewmats, Ks, w, h, covars=None, **kw):
+                col = (op[:, None] * feat[:, 0, :]).sum(0) / op.sum() + 0 * means.sum() + 0 * covars.sum()
+                return col.expand(len(viewmats), h, w, 3), None, None
+
+        state = {"gaussians": g, "ctx_c2w": np.repeat(np.eye(4)[None], 2, 0), "ctx_intr": np.repeat(np.eye(3)[None], 2, 0)}
+        state["ctx_c2w"][1, 0, 3] = 1.0
+        target = np.full((2, 16, 16, 3), 0.2, np.float32)
+        train = np.array([True, True, True, False, False, False])
+        snaps, log = optimize(MockRunner(), state, target, 16, [5, 60], train, {"lr": {"dc": 0.05}, "ssim_weight": 0.0})
+        self.assertEqual(sorted(snaps), [5, 60])
+        self.assertLess(log[-1]["loss"], log[0]["loss"] * 0.5)
+        h0, h60 = g.harmonics[0, :, :, 0], snaps[60].harmonics[0, :, :, 0]
+        torch.testing.assert_close(h60[3:], h0[3:])          # frozen Gaussians untouched
+        self.assertGreater(float((h60[:3] - h0[:3]).abs().max()), 1e-3)
+
     def test_target_poses_calib_identity_frame(self):
         from scripts.run_anysplat import target_poses
         c2w = np.repeat(np.eye(4)[None], 4, 0)

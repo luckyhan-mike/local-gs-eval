@@ -20,6 +20,10 @@ Round 9 (gs.reproject): for aligned sources, the virtual view's depth comes from
 colours from the two neighbouring input images (lgs/reproject.py); geometry gs = rendered Gaussian
 depth, vggt = AnySplat's VGGT depth maps forward-splatted. Written next to each token variant's local
 render as gs_tok<variant><size>_<render>_al_rp<geometry>_local (same token core, different colours).
+
+Round 10 (gs.tto): the Gaussians of the token reconstruction region are refined on the input views at
+full crop resolution (lgs/tto.py); each checkpoint is rendered like the feed-forward Gaussians, with
+suffix _tto<iterations> before _local (e.g. gs_tokrife448_nat_dil_al_tto300_local).
 """
 import argparse
 import sys
@@ -37,6 +41,7 @@ from lgs.common import (bbox, cam_path, cube_mask, imread_rgb, imwrite, load_cfg
 from lgs.aligned import aligned_reference, crop_K_to_raw, fit_plane, plane_homography  # noqa: E402
 from lgs.compat import anysplat_source  # noqa: E402
 from lgs.reproject import grid_points, reproject_view, zbuffer_depth  # noqa: E402
+from lgs.tto import optimize as tto_optimize  # noqa: E402
 
 
 def square_around(box, raw_shape, pad, min_side):
@@ -442,90 +447,114 @@ def main():
                         if s.startswith("aligned"):
                             poses_by_src[s] = (None, None, False, {"plane_rms_px": al["plane_rms_px"]})
 
-                for src, (tgt_c2w, tgt_intr, use_dist, pdiag) in poses_by_src.items():
-                    if pdiag and "ctx_rot_err_deg" in pdiag:
-                        print(f"  pose source {src}: ctx rot err after Sim3={max(pdiag['ctx_rot_err_deg']):.2f}deg "
-                              f"center err/baseline={max(pdiag['ctx_center_err_rel_baseline']):.3f}")
-                    for rv in gcfg["renders"]:
-                        if src.startswith("aligned"):
-                            res = None
-                            scale = al["K_al"][0, 0] / (state["ctx_intr"][ctx.index(al["ref"])][0, 0] * size)
-                        else:
-                            res = size if rv["res"] == "input" else side
-                            scale = res / size
-                        eps2d = rv["eps2d"]
-                        if eps2d == "auto":  # keep the 0.3 px dilation of the input grid when rendering denser
-                            eps2d = 0.3 * scale ** 2
-                        kw = dict(mode=rv["mode"], eps2d=eps2d, filter3d=rv["filter3d"],
-                                  filter3d_var=gcfg["filter3d_var"], filter3d_comp=gcfg.get("filter3d_comp", False))
-                        tail = f"{size}_{rv['name']}{POSE_SUFFIX[src]}"
-                        # full: all Gaussians of the crop; local: only the token reconstruction region
-                        outputs = {f"{base}_{rv['name']}{POSE_SUFFIX[src]}": (None, None, None, None)}
-                        for lab, (tv, kr, kc) in keeps.items():
-                            outputs[f"gs_{lab}{tail}_local"] = (tv, kr, kc, local_counts[lab])
-                        for variant, (tok_variant, kp, kp_core, counts) in outputs.items():
-                            out = work / "gs" / setup / variant
-                            t0 = time.time()
+                # Round 10: test-time optimisation of the token-region Gaussians on the input views;
+                # every checkpoint is rendered like the feed-forward Gaussians, with suffix _tto<iters>.
+                stages = [("", state, 0)]
+                ocfg = gcfg.get("tto") or {}
+                if ocfg.get("checkpoints") and keeps:
+                    if ocfg.get("scope", "local") == "local":
+                        train = np.logical_or.reduce([m for (_, kr, _) in keeps.values() for m in kr])
+                    else:
+                        train = np.ones(diag["num_gaussians"], bool)
+                    R = int(min(side, ocfg.get("max_res", 1008)))
+                    imgs = [cv2.resize(raws[k][y0:y0 + side, x0:x0 + side], (R, R), interpolation=cv2.INTER_AREA)
+                            .astype(np.float32) / 255.0 for k in ctx]
+                    t1 = time.time()
+                    snaps, olog = tto_optimize(runner, state, imgs, R, sorted(ocfg["checkpoints"]), train, ocfg,
+                                               eps2d=0.3 * (R / size) ** 2)
+                    diag["tto"] = {"train_gaussians": int(train.sum()), "res": R, "time_s": time.time() - t1,
+                                   "log": olog}
+                    print(f"  TTO: {int(train.sum())} of {diag['num_gaussians']} Gaussians at {R}px, "
+                          f"{time.time() - t1:.1f}s; ctx PSNR " + ", ".join(
+                              f"it{e['iter']}={np.mean(e['ctx_psnr']):.2f}" for e in olog
+                              if e["iter"] == 1 or e["iter"] in snaps))
+                    stages += [(f"_tto{it}", dict(state, gaussians=g_), it) for it, g_ in sorted(snaps.items())]
+
+                for stage, gst, tto_iter in stages:
+                    for src, (tgt_c2w, tgt_intr, use_dist, pdiag) in poses_by_src.items():
+                        if pdiag and "ctx_rot_err_deg" in pdiag:
+                            print(f"  pose source {src}: ctx rot err after Sim3={max(pdiag['ctx_rot_err_deg']):.2f}deg "
+                                  f"center err/baseline={max(pdiag['ctx_center_err_rel_baseline']):.3f}")
+                        for rv in gcfg["renders"]:
                             if src.startswith("aligned"):
-                                views = render_aligned(runner, state, al, src, kp, kw)
-                                cores = render_aligned(runner, state, al, src, kp_core, kw) if kp_core is not None \
-                                    else None
+                                res = None
+                                scale = al["K_al"][0, 0] / (state["ctx_intr"][ctx.index(al["ref"])][0, 0] * size)
                             else:
-                                views = []
-                                cores = [] if kp_core is not None else None
-                                for i, k in enumerate(targets):
-                                    sl = slice(i, i + 1)
-                                    rgb, alpha = runner.render(state, tgt_c2w[sl], tgt_intr[sl], res,
-                                                               keep=kp[i] if kp is not None else None, **kw)
-                                    dmap = None
-                                    if use_dist:
-                                        dmap = dmaps.setdefault(k, distort_maps(rig[k]["K"], rig[k]["dist"], raw_shape))
-                                    views.append(paste_and_warp(rgb[0], alpha[0], win, raw_shape, hs[k],
-                                                                aligned_shape, dmap))
-                                    if kp_core is not None:
-                                        acore = runner.render(state, tgt_c2w[sl], tgt_intr[sl], res, keep=kp_core[i],
-                                                              **kw)[1]
-                                        cores.append(paste_and_warp(rgb[0], acore[0], win, raw_shape, hs[k],
+                                res = size if rv["res"] == "input" else side
+                                scale = res / size
+                            eps2d = rv["eps2d"]
+                            if eps2d == "auto":  # keep the 0.3 px dilation of the input grid when rendering denser
+                                eps2d = 0.3 * scale ** 2
+                            kw = dict(mode=rv["mode"], eps2d=eps2d, filter3d=rv["filter3d"],
+                                      filter3d_var=gcfg["filter3d_var"], filter3d_comp=gcfg.get("filter3d_comp", False))
+                            tail = f"{size}_{rv['name']}{POSE_SUFFIX[src]}"
+                            # full: all Gaussians of the crop; local: only the token reconstruction region
+                            outputs = {f"{base}_{rv['name']}{POSE_SUFFIX[src]}{stage}": (None, None, None, None)}
+                            for lab, (tv, kr, kc) in keeps.items():
+                                outputs[f"gs_{lab}{tail}{stage}_local"] = (tv, kr, kc, local_counts[lab])
+                            for variant, (tok_variant, kp, kp_core, counts) in outputs.items():
+                                out = work / "gs" / setup / variant
+                                t0 = time.time()
+                                if src.startswith("aligned"):
+                                    views = render_aligned(runner, gst, al, src, kp, kw)
+                                    cores = render_aligned(runner, gst, al, src, kp_core, kw) if kp_core is not None \
+                                        else None
+                                else:
+                                    views = []
+                                    cores = [] if kp_core is not None else None
+                                    for i, k in enumerate(targets):
+                                        sl = slice(i, i + 1)
+                                        rgb, alpha = runner.render(gst, tgt_c2w[sl], tgt_intr[sl], res,
+                                                                   keep=kp[i] if kp is not None else None, **kw)
+                                        dmap = None
+                                        if use_dist:
+                                            dmap = dmaps.setdefault(k, distort_maps(rig[k]["K"], rig[k]["dist"], raw_shape))
+                                        views.append(paste_and_warp(rgb[0], alpha[0], win, raw_shape, hs[k],
                                                                     aligned_shape, dmap))
-                            t_render = (time.time() - t0) / len(targets)
-                            for i, k in enumerate(targets):
-                                img, a, valid = views[i]
-                                imwrite(out / f"cam{k}.png", img)
-                                imwrite(out / f"cam{k}_alpha.png", np.clip(a, 0, 1))
-                                write_mask(out / f"cam{k}_valid.png", valid)
-                                if cores is not None:
-                                    imwrite(out / f"cam{k}_alpha_core.png", np.clip(cores[i][1], 0, 1))
-                            meta = dict(diag, window=list(win), size=size, crop=crop, token_variant=tok_variant,
-                                        token_window=gcfg.get("token_window", "fixed") if crop == "token" else None,
-                                        local_gaussians=counts, render=rv, render_res=res,
-                                        eps2d_used=float(eps2d), time_render_per_view_s=t_render, pose_source=src,
-                                        pose_diag=pdiag, local=kp is not None)
-                            save_json(out / "meta.json", meta)
-                            print(f"  {variant}: res={res or 'aligned'} mode={rv['mode']} eps2d={eps2d:.3f} "
-                                  f"filter3d={rv['filter3d']} render/view={t_render * 1000:.1f}ms")
-                            # Round 9: same token core, colours from the input images, depth from gs / vggt
-                            if kp is None or cores is None or src not in rcfg.get("sources", ["aligned_int"]):
-                                continue
-                            for geom in rcfg.get("geometries") or []:
-                                if (src, geom) not in rp_cache:
-                                    t1 = time.time()
-                                    rp_cache[(src, geom)] = reproject_targets(
-                                        runner, state, al, src, ctx, targets, shared_t, raws, win, geom, rcfg, depth)
-                                    rp_cache[(src, geom)] += ((time.time() - t1) / len(targets),)
-                                    st = rp_cache[(src, geom)][1]
-                                    print(f"  reproject[{src}/{geom}]: "
-                                          + ", ".join(f"cam{x['target']} both={x['seen_by_both']:.2f} "
-                                                      f"none={x['seen_by_none']:.2f}" for x in st))
-                                views_rp, st, t_rp = rp_cache[(src, geom)]
-                                out_rp = work / "gs" / setup / variant.replace("_local", f"_rp{geom}_local")
+                                        if kp_core is not None:
+                                            acore = runner.render(gst, tgt_c2w[sl], tgt_intr[sl], res, keep=kp_core[i],
+                                                                  **kw)[1]
+                                            cores.append(paste_and_warp(rgb[0], acore[0], win, raw_shape, hs[k],
+                                                                        aligned_shape, dmap))
+                                t_render = (time.time() - t0) / len(targets)
                                 for i, k in enumerate(targets):
-                                    img, a, valid = views_rp[i]
-                                    imwrite(out_rp / f"cam{k}.png", img)
-                                    imwrite(out_rp / f"cam{k}_alpha.png", np.clip(a, 0, 1))
-                                    write_mask(out_rp / f"cam{k}_valid.png", valid)
-                                    imwrite(out_rp / f"cam{k}_alpha_core.png", np.clip(cores[i][1], 0, 1))
-                                save_json(out_rp / "meta.json", dict(meta, reproject=geom, reproject_stats=st,
-                                                                     time_render_per_view_s=t_rp))
+                                    img, a, valid = views[i]
+                                    imwrite(out / f"cam{k}.png", img)
+                                    imwrite(out / f"cam{k}_alpha.png", np.clip(a, 0, 1))
+                                    write_mask(out / f"cam{k}_valid.png", valid)
+                                    if cores is not None:
+                                        imwrite(out / f"cam{k}_alpha_core.png", np.clip(cores[i][1], 0, 1))
+                                meta = dict(diag, window=list(win), size=size, crop=crop, token_variant=tok_variant,
+                                            token_window=gcfg.get("token_window", "fixed") if crop == "token" else None,
+                                            local_gaussians=counts, render=rv, render_res=res,
+                                            eps2d_used=float(eps2d), time_render_per_view_s=t_render, pose_source=src,
+                                            pose_diag=pdiag, local=kp is not None, tto_iters=tto_iter)
+                                save_json(out / "meta.json", meta)
+                                print(f"  {variant}: res={res or 'aligned'} mode={rv['mode']} eps2d={eps2d:.3f} "
+                                      f"filter3d={rv['filter3d']} render/view={t_render * 1000:.1f}ms")
+                                # Round 9: same token core, colours from the input images, depth from gs / vggt
+                                if stage or kp is None or cores is None or src not in rcfg.get("sources", ["aligned_int"]):
+                                    continue
+                                for geom in rcfg.get("geometries") or []:
+                                    if (src, geom) not in rp_cache:
+                                        t1 = time.time()
+                                        rp_cache[(src, geom)] = reproject_targets(
+                                            runner, state, al, src, ctx, targets, shared_t, raws, win, geom, rcfg, depth)
+                                        rp_cache[(src, geom)] += ((time.time() - t1) / len(targets),)
+                                        st = rp_cache[(src, geom)][1]
+                                        print(f"  reproject[{src}/{geom}]: "
+                                              + ", ".join(f"cam{x['target']} both={x['seen_by_both']:.2f} "
+                                                          f"none={x['seen_by_none']:.2f}" for x in st))
+                                    views_rp, st, t_rp = rp_cache[(src, geom)]
+                                    out_rp = work / "gs" / setup / variant.replace("_local", f"_rp{geom}_local")
+                                    for i, k in enumerate(targets):
+                                        img, a, valid = views_rp[i]
+                                        imwrite(out_rp / f"cam{k}.png", img)
+                                        imwrite(out_rp / f"cam{k}_alpha.png", np.clip(a, 0, 1))
+                                        write_mask(out_rp / f"cam{k}_valid.png", valid)
+                                        imwrite(out_rp / f"cam{k}_alpha_core.png", np.clip(cores[i][1], 0, 1))
+                                    save_json(out_rp / "meta.json", dict(meta, reproject=geom, reproject_stats=st,
+                                                                         time_render_per_view_s=t_rp))
                 del state
 
 

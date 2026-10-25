@@ -416,17 +416,21 @@ def main():
 
 
 def reproject_table(rows, ref):
-    """Round 9: same token core, three colour sources (GS colours / input texture with GS depth / input
-    texture with VGGT depth), pasted directly and on the oracle part of the core."""
+    """Rounds 9-10: same token core, different colour sources (feed-forward GS colours, input texture with
+    GS / VGGT depth, GS after test-time optimisation), pasted directly and on the oracle part of the core."""
     fgm = {(r[0], int(r[1]), r[2]): (r[4], r[6]) for r in rows if r[3] == "fg"}
     reg = {(r[0], int(r[1]), r[2], r[3]): (r[4], r[6]) for r in rows if r[3] in ("object", "rest")}
     methods = {m for (_, _, m) in fgm}
-    rp = sorted({re.sub(r"_rp\w+?_local\]$", "_local]", m) for m in methods
-                 if m.startswith("hyb_token[") and re.search(r"_rp\w+?_local\]$", m)})
+    pat = re.compile(r"_(rp\w+?|tto\d+)_local\]$")
+    rp = sorted({pat.sub("_local]", m) for m in methods if m.startswith("hyb_token[") and pat.search(m)})
     if not rp:
         return []
-    kinds = [("", "GS 颜色"), ("_rpgs", "GS 几何 + 输入纹理"), ("_rpvggt", "VGGT 几何 + 输入纹理")]
-    out = ["", "### 纹理取自输入图（第九轮：同一 token 贴回区，颜色来源不同；oracle = 只贴 core ∩ 真值失败区）", "",
+    sufs = sorted({"_" + pat.search(m).group(1) for m in methods if m.startswith("hyb_token[") and pat.search(m)},
+                  key=lambda x: (x.startswith("_tto"), int(x[4:]) if x.startswith("_tto") else 0, x))
+    names = {"_rpgs": "GS 几何 + 输入纹理", "_rpvggt": "VGGT 几何 + 输入纹理"}
+    kinds = [("", "GS 前馈颜色")] + [(x, names.get(x, f"GS 测试时优化 {x[4:]} 步" if x.startswith("_tto") else x))
+                                   for x in sufs]
+    out = ["", "### 颜色来源对比（第九轮输入纹理 / 第十轮测试时优化：同一 token 贴回区；oracle = 只贴 core ∩ 真值失败区）", "",
            "| 设置 | token 变体 | 颜色来源 | 贴回 | fg PSNR / LPIPS | object PSNR / LPIPS | rest PSNR | 不差目标数 |",
            "|---|---|---|---|---:|---:|---:|---:|"]
     for s in sorted({r[0] for r in rows}):
@@ -454,7 +458,7 @@ def reproject_table(rows, ref):
                     ln = line(name, kind, how, m)
                     if ln:
                         out.append(ln)
-    return [x for x in out if x]
+    return [x for x in out if x is not None]
 
 
 def target_check_table(rows, chk_rows, ref):

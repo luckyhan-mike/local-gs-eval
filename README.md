@@ -14,7 +14,31 @@
 
 ---
 
-## 0. 第九轮：几何来自 3D，纹理取自输入图（当前主实验）
+## 0. 第十轮：局部 GS 测试时优化（当前主实验）
+
+第九轮结论：从输入原图取纹理，两条路线都明显差于直接用 GS 颜色（cam3 rife：GS 颜色 26.38 / 0.0537；GS 几何 + 输入纹理 23.48 / 0.0908；VGGT 几何 + 输入纹理 24.52 / 0.0997；object LPIPS 从 0.16 恶化到 0.40）。原因有两点：
+- GS / VGGT 几何用来做对齐足够准，但按像素取色不够准。魔方色块边缘锐利，深度差 1–2 px（448 分辨率）就会取到相邻色块，出现"清晰但位置错"的纹理，而 LPIPS 对错位的惩罚比对模糊更重。
+- VGGT 深度和 GS 深度在输入视点上只差 0.3–0.7%（两者同源），换成 VGGT 不会得到更好的几何。VGGT 路线另有 z-buffer 放大造成的条纹空洞（实现问题）。
+
+结论是：GS 颜色虽然偏软，但它和各视点一致，几何小误差表现为模糊而不是错位。要让补丁变好，就得**让 GS 本身变清晰**。
+
+第十轮以 AnySplat 前馈高斯为初值，在输入视点上做**测试时优化**（`lgs/tto.py`，`gs.tto`）：
+- 监督用输入视点的**全分辨率裁剪**（约 911 px，而不是 448）。损失为 0.8·L1 + 0.2·(1−SSIM)。
+- 默认只优化 token 重建区（各变体并集）里的高斯（`scope: local`），其余高斯固定但照常渲染。不做加密/剪枝，所以各变体的局部选择、贴回区都不变。
+- 参数：位置（学习率乘以基线长度）、协方差（`cov = L0(I+A)(I+A)ᵀL0ᵀ`，L0 为前馈协方差的 Cholesky 因子，A 初值 0，第一次渲染与前馈完全相同）、不透明度、SH 直流颜色。高阶 SH 默认不优化（`sh_rest: false`），因为输入视点少，容易过拟合视角相关颜色。
+- 检查点 300 和 1000 步各渲染一套：`gs_tok<变体>448_nat_dil_al_tto300_local` / `…_tto1000_local`（`_alv` 同理），与前馈版本共用同一 token 贴回区，是严格对照。
+- 日志打印 TTO 前后输入视点 PSNR（只是拟合程度，越高不代表新视点越好）和耗时，写入 `meta.json` 的 `tto`。
+- 第九轮的输入纹理重投影默认关闭（`gs.reproject.geometries: []`）。
+
+`summary.md` 的"颜色来源对比"表按 token 变体列出前馈 / TTO300 / TTO1000 × 直接贴回 / oracle 的 fg、object、rest 和不差目标数。
+
+判断标准：
+1. TTO 是否让补丁变清晰：同一 token 下 cam3 object LPIPS 明显低于前馈的约 0.16，fg 高于 26.4。
+2. cam5 能否超过光流：至少 oracle 行优于 28.00 / 0.0396。
+3. 是否过拟合：输入视点 PSNR 很高、但留出视点变差（尤其 1000 步差于 300 步），说明 3/5 个视点约束不够，需要更少步数或更强正则。
+4. 速度代价：日志中 TTO 耗时（每帧额外开销）。
+
+## 0.000 第九轮：几何来自 3D，纹理取自输入图
 
 第八轮结论：目标侧复核几乎没有改变贴回区。光流自己的风险信号在魔方边缘总会亮，不管合成得对不对，和 token 检测本质上是同一信息。更关键的是，**完美检测也只多出很少的收益**：
 
@@ -258,6 +282,19 @@ cd local-gs-eval && git pull
 HF_HUB_OFFLINE=1 PYTHONUNBUFFERED=1 bash run_all.sh configs/mofang_9cam.yaml
 python -m unittest discover -s tests -v
 ```
+
+**第十轮（复用第七轮的 token；GS 需要重跑以做测试时优化）**：
+
+```bash
+export LGS_WORK_DIR=work/round10
+mkdir -p $LGS_WORK_DIR && cp -r work/round7/{prepare,flow,poses,tokens,compat_packages} $LGS_WORK_DIR/
+python scripts/run_anysplat.py  --config configs/mofang_9cam.yaml
+python scripts/evaluate.py      --config configs/mofang_9cam.yaml
+python scripts/validate_results.py configs/mofang_9cam.yaml
+python -m unittest discover -s tests -v
+```
+
+每个设置的日志会有一行 `TTO: … Gaussians at …px, …s; ctx PSNR it1=… it300=… it1000=…`。先看 `summary.md` 的"颜色来源对比"表。若显存不足，可把 `gs.tto.max_res` 调小（例如 672）。
 
 **第九轮（复用第七轮的 token；GS 需要重跑，因为要输出深度和重投影结果）**：
 
