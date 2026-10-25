@@ -413,7 +413,8 @@ def main():
     tok_json = work / "tokens" / "tokens.json"
     token_report = load_json(tok_json) if tok_json.exists() else None
     write_summary(out_dir / "summary.md", rows, auc_rows, t_rows, gs_rows, reg_rows, sweep_rows, tuned, rcfg, ref,
-                  paste_rows, token_rows, token_report, chk_rows)
+                  paste_rows, token_rows, token_report, chk_rows, tto_info,
+                  ecfg.get("tto_main_variant", "rife"))
     print(f"done -> {out_dir / 'summary.md'}")
 
 
@@ -550,7 +551,8 @@ def target_check_table(rows, chk_rows, ref):
 
 
 def write_summary(path, rows, auc_rows, t_rows, gs_rows, reg_rows, sweep_rows, tuned, rcfg, ref,
-                  paste_rows=(), token_rows=(), token_report=None, chk_rows=()):
+                  paste_rows=(), token_rows=(), token_report=None, chk_rows=(),
+                  tto_info=None, tto_main_variant="rife"):
     agg = defaultdict(list)
     area = defaultdict(list)
     for s, k, meth, r, p, ss, l, apx, afr, cov in rows:
@@ -657,7 +659,7 @@ def write_summary(path, rows, auc_rows, t_rows, gs_rows, reg_rows, sweep_rows, t
                 lines.append(f"| {s} | {k} | {a}-{b} | {fmt(fp)} / {fmt(fl, 4)} | " + " | ".join(cells) + " |")
         if chk_rows:
             lines += target_check_table(rows, chk_rows, ref)
-        lines += tto_speed_table(rows, ref, tto_info, ecfg.get("tto_main_variant", "rife"))
+        lines += tto_speed_table(rows, ref, tto_info or {}, tto_main_variant)
         lines += reproject_table(rows, ref)
         lines += ["", "## 其余诊断（整窗口 GS、用真值配准的上限等）", ""]
     def pose_src(m):
