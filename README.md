@@ -14,6 +14,67 @@
 
 ---
 
+## 第十三轮（当前）：TTO 防漂浮物 + 六路数据收窄贴回区
+
+| 机器 | 标签 | 跑什么 | 配置 |
+|---|---|---|---|
+| linux-3090 | `linux-3090-round13` | 魔方数据精简流程（复用 `work/round7`），确认漂浮物修好 | `configs/mofang_9cam_lean.yaml` |
+| linux-4090 | `linux-4090-round13` | 六路数据集 5 组场景，输入 0/3/5 | `configs/dataset6_lean.yaml` |
+
+**上一轮的问题**：
+- 3090 第十二轮，魔方 cam5 目标 3：TTO 200 步时 fg 掉了 3.07 dB。
+- 4090 六路数据 changjing1/shot_0012 目标 4：200 步时 rest 区域 PSNR 从 30.1 掉到 25.0 dB。
+
+两处都是逐视图紧裁监督以后，高斯漂出监督框，成了新视点里的漂浮物。另外，六路数据的直接贴回在 15 个目标里只有 1 个不差于光流，oracle 贴回有 8 个，原因有两个：
+- 贴回区是真实失败区的 4–7 倍；
+- 编码窗口占满 1296 px，GS 被放大 2.9 倍。
+
+**本轮改动（两台机器共用）**，都在 `gs.tto` 里：
+- 位置学习率降为原来的 1/10（`lr.means: 1.6e-5`）。
+- 每步优化后，把位置偏移限制在该高斯自身尺寸以内（`max_disp_scale: 1.0`，尺寸 = 前馈协方差迹的平方根）。
+- 协方差每个方向的缩放限制在 1/1.5 到 1.5 倍之间（`max_cov_scale: 1.5`）。
+- 检查点改为 25 / 50 / 100 步。
+
+**本轮改动（只在六路数据上）**：
+- 编码窗口只按 rife 的重建区来定（`gs.window_variants: [rife]`），不再并入很松的 r5。
+- TTO 监督分辨率提高到窗口原分辨率（`max_res: 1296`）。
+- 新增两档更严的 token：`rife_w30`（|W0−W1| > 0.30，共线残差 > 9 px）和 `rife_w40`（0.40，12 px），和 rife 一起做局部渲染与贴回。TTO 只做一次，各变体共用。
+- 注意：这两档阈值是看过这 5 组场景的结果后定的，有过拟合的风险，只用来回答"贴回区收窄能不能让直接贴回超过光流"。
+
+**3090 跑法**：
+
+```bash
+cd /home/han/linux-han/local-gs-eval && git fetch --tags -f && git checkout linux-3090-round13
+export LGS_WORK_DIR=work/round13 HF_HUB_OFFLINE=1 PYTHONUNBUFFERED=1
+mkdir -p $LGS_WORK_DIR && cp -r work/round7/{prepare,flow,poses,tokens,compat_packages} $LGS_WORK_DIR/
+python -m unittest discover -s tests -v
+python scripts/run_anysplat.py --config configs/mofang_9cam_lean.yaml 2>&1 | tee $LGS_WORK_DIR/1_anysplat.log
+python scripts/evaluate.py --config configs/mofang_9cam_lean.yaml 2>&1 | tee $LGS_WORK_DIR/3_evaluate.log
+python scripts/validate_results.py configs/mofang_9cam_lean.yaml
+```
+
+结果上传到 `experiment/linux-3090-round13-<日期>`。
+
+**4090 跑法**：环境、数据和第一次相同，按下面 ★ 一节准备。token 的阈值变了，所以要从 prepare 起全部重跑：
+
+```bash
+cd $DATA_ROOT/local-gs-eval && git fetch --tags -f && git checkout linux-4090-round13
+rm -rf work/dataset6
+python -m unittest discover -s tests -v
+python scripts/run_scenes.py --config configs/dataset6_lean.yaml 2>&1 | tee work/dataset6_run.log
+```
+
+结果上传到 `experiment/linux-4090-round13-<日期>`，要上传的内容同 ★ 一节第 6 步。`summary_all.md` 现在按 token 变体分别列出"全部场景合计"和"逐场景"两张表，并多了"贴回区"（实际贴回面积占前景比例）和"编码窗口边长"两列。
+
+**判断标准**：
+1. **漂浮物是否修好**：
+   - 3090 魔方 cam5 目标 3，TTO 100 步不再明显掉分；cam3 50 步仍是 6/6。
+   - 4090 上各场景的 rest PSNR 不再随步数下降。
+2. **六路数据窗口是否变小**：看"编码窗口边长"，原来是 1296。
+3. **收窄贴回区能否让直接贴回超过光流**：
+   - 对比 rife、rife_w30、rife_w40 的贴回区面积，以及 fg 的 PSNR / LPIPS 和不差目标数。
+   - 参照的上限是上一轮的 oracle：26.13 / 0.0911，8/15 不差。
+
 ## ★ 新主机（RTX 4090，Linux）从零部署并运行六路数据集实验
 
 本节是完整的操作清单，可以交给自动执行的 AI 按顺序完成。每一步都有检查方法；不满足时停下来报告，不要跳过。

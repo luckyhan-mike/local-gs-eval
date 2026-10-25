@@ -7,8 +7,8 @@ texture can sharpen while geometry stays close to the feed-forward initialisatio
 
 Parameterisation (keeps the first render bit-identical to the feed-forward one):
   means       position offset, learning rate scaled by the context baseline length
-  covariance  cov = L0 (I + A)(I + A)^T L0^T, L0 = Cholesky factor of AnySplat's covariance, A lower
-              triangular and initialised to 0 (no assumption on the quaternion convention)
+  covariance  cov = L0 (I + A)(I + A)^T L0^T, L0 = Cholesky factor of AnySplat's covariance, A a full
+              3x3 matrix initialised to 0 (no assumption on the quaternion convention)
   opacity     logit
   colour      SH DC term (higher orders optional: few input views overfit view dependence)
 Only Gaussians in `train_mask` (the token reconstruction region in the default local scope) are
@@ -21,6 +21,10 @@ is shifted so the box is an exact sub-window of the full view. The wall time to 
 logged (CUDA synchronised).
 Round 12: with ocfg["crop"]["per_view"] every view gets its own tight box and is rasterised separately
 (one call per view and step), instead of one common box size for all views.
+Round 13 (floaters): with tight per-view boxes a Gaussian that drifts out of a view's box is no longer
+constrained by that view and shows up as a floater in novel views (round 12, 200 steps). After every
+step the position offset is clipped to max_disp_scale x the Gaussian's own size (sqrt of the trace of
+its feed-forward covariance) and the singular values of (I + A) to [1/max_cov_scale, max_cov_scale].
 """
 import time
 from types import SimpleNamespace
@@ -58,7 +62,7 @@ def cov_factor(cov, rel_eps=1e-6):
 
 
 def cov_from(L0, A):
-    M = L0 @ (torch.eye(3, device=L0.device, dtype=L0.dtype) + torch.tril(A))
+    M = L0 @ (torch.eye(3, device=L0.device, dtype=L0.dtype) + A)
     return M @ M.transpose(-1, -2)
 
 
@@ -159,6 +163,24 @@ def optimize(runner, state, images, res, checkpoints, train_mask, ocfg, eps2d=0.
     quats0 = g.rotations[0].float().detach()
     scales0 = g.scales[0].float().detach()
     w_ssim = float(ocfg.get("ssim_weight", 0.2))
+    m0 = means0[idx]
+    disp_cap = ocfg.get("max_disp_scale")  # None: unconstrained (rounds 10-12)
+    size0 = torch.sqrt(torch.diagonal(cov0[idx], dim1=-2, dim2=-1).sum(-1).clamp(min=1e-20))[:, None]
+    cov_cap = ocfg.get("max_cov_scale")
+    eye3 = torch.eye(3, device=means0.device)
+
+    def constrain():
+        with torch.no_grad():
+            if disp_cap is not None:
+                d = p["means"] - m0
+                lim = float(disp_cap) * size0
+                n = d.norm(dim=1, keepdim=True).clamp(min=1e-20)
+                p["means"].copy_(m0 + d * torch.clamp(lim / n, max=1.0))
+            if cov_cap is not None:
+                u, sv, vh = torch.linalg.svd(eye3 + p["A"])
+                c = float(cov_cap)
+                if bool((sv > c).any() or (sv < 1.0 / c).any()):
+                    p["A"].copy_(u @ torch.diag_embed(sv.clamp(1.0 / c, c)) @ vh - eye3)
 
     def assemble():
         means = means0.index_copy(0, idx, p["means"])
@@ -197,6 +219,7 @@ def optimize(runner, state, images, res, checkpoints, train_mask, ocfg, eps2d=0.
         opt.zero_grad(set_to_none=True)
         loss.backward()
         opt.step()
+        constrain()
         if it in checkpoints and cuda:
             torch.cuda.synchronize()
         t_it = time.time() - t_start

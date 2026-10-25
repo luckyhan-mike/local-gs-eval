@@ -80,7 +80,7 @@ gs:
     vis_tol: 0.05                       # 输入相机可见性：点深度 ≤ 该相机深度图 ×(1+vis_tol)
     splat_scale: null                   # vggt 点前向投影的分辨率比例；null = 448/窗口边长（点密度约每像素 1 个）
   tto:                                  # 第十轮：局部 GS 测试时优化（lgs/tto.py），以前馈高斯为初值，在输入视点全分辨率裁剪上优化
-    checkpoints: [50, 100, 200]         # 精简：第十一轮 100 步后几乎不再提升
+    checkpoints: [25, 50, 100]          # 第十三轮：收益集中在前 50~100 步，200 步会出漂浮物
     crop:                               # 第十一轮提速：只在可训练高斯投影的外接框（+边距）内渲染与监督，不再渲染整幅输入视图
       enabled: true
       margin_px: 32                     # 外接框四周余量（监督分辨率下的像素）
@@ -90,7 +90,9 @@ gs:
     max_res: 1008                       # 监督分辨率上限（窗口约 911 px 时即原分辨率）
     sh_rest: false                      # 只优化 SH 直流项；输入视点少，高阶 SH 容易过拟合视角相关颜色
     ssim_weight: 0.2                    # loss = 0.8·L1 + 0.2·(1−SSIM)
-    lr: {means: 1.6e-4, cov: 5.0e-3, opacity: 2.5e-2, dc: 2.5e-3}   # means 再乘输入相机基线长度（3DGS 默认量级）
+    lr: {means: 1.6e-5, cov: 5.0e-3, opacity: 2.5e-2, dc: 2.5e-3}   # means 再乘输入相机基线长度；第十三轮位置学习率降为 3DGS 默认的 1/10
+    max_disp_scale: 1.0                 # 第十三轮：每步后把位置偏移限制在该高斯自身尺寸（前馈协方差迹的平方根）以内，防止漂出监督框成为漂浮物
+    max_cov_scale: 1.5                  # 第十三轮：协方差每个方向的缩放限制在 [1/1.5, 1.5] 倍，防止拉成长条
   keep_mode: visible                    # 局部高斯：visible=输入相机中深度测试后的可见表面；ray=视线穿过即保留（第四轮，足迹过大）
   visible_tol: 0.03                     # 可见性深度容差（相对）
   renders:                              # 每个 (crop, size) 只编码一次；第二、三轮滤波核差异 <0.1 dB，只保留 nat_dil
@@ -116,5 +118,5 @@ eval:
   # 第八轮：目标侧光流风险复核。贴回区 = token core ∩ 参考光流在实际 t 下的风险区（|W0-W1| > warp 或共线残差 > col，
   # 外扩 dilate_px，限制在光流结果抠像前景附近；不用真值）。每项生成 hyb_tokchk_<name>[v]，另附 oracle（core ∩ 真值失败区）作上限。
   # 第八轮结论：w06~w20 与不复核几乎相同（光流风险区本来就覆盖 token core），本轮只保留 w20 与 oracle。
-  target_check_suffix: [_al_local, _al_tto50_local, _al_tto100_local, _al_tto200_local]   # 前馈与各 TTO 检查点的 oracle 上限
+  target_check_suffix: [_al_local, _al_tto25_local, _al_tto50_local, _al_tto100_local]   # 前馈与各 TTO 检查点的 oracle 上限
   target_check: []                      # 精简：第八轮 w20 与不复核几乎相同；[] = 只做 oracle

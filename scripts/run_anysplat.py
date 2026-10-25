@@ -386,8 +386,11 @@ def main():
                 # still covers every detected variant, so the Gaussians match the earlier rounds.
                 lv = gcfg.get("local_variants")
                 sel = {v: ts for v, ts in live.items() if not lv or v in lv}
+                # gs.window_variants (round 13): which variants define the encode window (default: all)
+                wv = gcfg.get("window_variants")
+                wsets = [ts for v, ts in live.items() if not wv or v in wv] or list(live.values())
                 if gcfg.get("token_window", "fixed") == "fixed":
-                    union = [np.logical_or.reduce([ts["recon"][i] for ts in live.values()]) for i in range(len(ctx))]
+                    union = [np.logical_or.reduce([ts["recon"][i] for ts in wsets]) for i in range(len(ctx))]
                     jobs.append((crop, "tok", union, {f"tok{v}": (v, ts) for v, ts in sel.items()}))
                 else:
                     jobs += [(crop, f"tok{v}", ts["recon"], {f"tok{v}": (v, ts)}) for v, ts in sel.items()]

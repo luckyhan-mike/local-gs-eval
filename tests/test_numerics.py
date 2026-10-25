@@ -359,6 +359,41 @@ class NumericsTests(unittest.TestCase):
         self.assertLess(log[0]["box"]["area_frac"], 1.0)
         self.assertEqual(len(log[-1]["ctx_psnr"]), 2)
 
+    def test_tto_position_and_covariance_caps(self):
+        import torch
+        from types import SimpleNamespace
+        from lgs.tto import optimize
+        n = 5
+        rng = np.random.default_rng(1)
+        s = torch.full((n, 3), 0.05)
+        cov = torch.diag_embed(s ** 2)
+        means = torch.as_tensor(rng.normal(size=(1, n, 3)), dtype=torch.float32)
+        means[0, :, 2] = 3.0
+        g = SimpleNamespace(means=means, covariances=cov[None], opacities=torch.full((1, n), 0.5),
+                            rotations=torch.zeros(1, n, 4), scales=s[None],
+                            harmonics=torch.full((1, n, 3, 1), 0.5))
+
+        class PullRunner:  # loss rewards moving every Gaussian far along +x and growing its covariance
+            device = "cpu"
+            model = SimpleNamespace(decoder=SimpleNamespace(background_color=torch.zeros(3)))
+
+            def rasterization(self, means, quats, scales, op, feat, viewmats, Ks, w, h, covars=None, **kw):
+                v = torch.sigmoid(-means[:, 0].mean() - covars.diagonal(dim1=-2, dim2=-1).sum(-1).mean() * 100)
+                return v.expand(len(viewmats), h, w, 3), None, None
+
+        state = {"gaussians": g, "ctx_c2w": np.repeat(np.eye(4)[None], 2, 0), "ctx_intr": np.repeat(np.eye(3)[None], 2, 0)}
+        state["ctx_c2w"][1, 0, 3] = 1.0
+        train = np.ones(n, bool)
+        snaps, _ = optimize(PullRunner(), state, np.zeros((2, 8, 8, 3), np.float32), 8, [40], train,
+                            {"lr": {"means": 1.0, "cov": 0.5}, "ssim_weight": 0.0,
+                             "max_disp_scale": 1.0, "max_cov_scale": 1.5})
+        size = float(np.sqrt(3 * 0.05 ** 2))
+        disp = (snaps[40].means[0] - means[0]).norm(dim=1)
+        self.assertLessEqual(float(disp.max()), size * 1.001)
+        self.assertGreater(float(disp.min()), size * 0.5)          # the pull was strong enough to hit the cap
+        ratio = snaps[40].covariances[0].diagonal(dim1=-2, dim2=-1) / cov.diagonal(dim1=-2, dim2=-1)
+        self.assertLessEqual(float(ratio.max()), 1.5 ** 2 * 1.001)
+
     def test_tto_crop_box_is_exact_subwindow(self):
         import torch
         from lgs.tto import crop_boxes

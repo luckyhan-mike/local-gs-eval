@@ -119,9 +119,14 @@ def main():
 
 def summarize(root, shots, base):
     ref = base["eval"]["ref_flow"]
-    variant = base["eval"].get("tto_main_variant", "rife")
-    pat = re.compile(rf"^(hyb_token|hyb_tokchk_oracle)\[gs_tok{re.escape(variant)}\d+_.+_al(?:_tto(\d+))?_local\]$")
-    per = defaultdict(dict)    # (shot, setup, stage, how) -> {(target, region): (psnr, lpips)}
+    main_v = base["eval"].get("tto_main_variant", "rife")
+    variants = base["gs"].get("local_variants") or [main_v]
+    size = base["gs"]["sizes"][0]
+    pats = {v: re.compile(rf"^(hyb_token|hyb_tokchk_oracle)\[gs_tok{re.escape(v)}{size}_.+_al(?:_tto(\d+))?_local\]$")
+            for v in variants}
+    gpat = {v: re.compile(rf"^gs_tok{re.escape(v)}{size}_.+_al(?:_tto(\d+))?_local$") for v in variants}
+    per = defaultdict(dict)    # (shot, setup, variant, stage, how) -> {(target, region): (psnr, lpips)}
+    area = defaultdict(dict)   # (shot, setup, variant, stage, how) -> {target: paste area / fg}
     times = {}
     for shot in shots:
         work = root / shot.replace("/", "_")
@@ -132,21 +137,33 @@ def summarize(root, shots, base):
         for r in csv.DictReader(mfile.open(encoding="utf-8")):
             if r["region"] not in ("fg", "object", "rest"):
                 continue
+            keys = []
             if r["method"] == ref:
-                key = (shot, r["setup"], "flow", "—")
-            else:
+                keys = [(shot, r["setup"], v, "flow", "—") for v in variants]
+            for v, pat in pats.items():
                 m = pat.match(r["method"])
-                if not m:
-                    continue
-                key = (shot, r["setup"], int(m.group(2) or 0), "直接" if m.group(1) == "hyb_token" else "oracle")
-            per[key][(int(r["target"]), r["region"])] = (float(r["psnr"]), float(r["lpips"]))
-        for meta in (work / "gs").glob(f"*/gs_tok{variant}*_al_tto*_local/meta.json"):
+                if m:
+                    keys.append((shot, r["setup"], v, int(m.group(2) or 0),
+                                 "直接" if m.group(1) == "hyb_token" else "oracle"))
+            for key in keys:
+                per[key][(int(r["target"]), r["region"])] = (float(r["psnr"]), float(r["lpips"]))
+        cfile = work / "eval" / "tokchk.csv"
+        if cfile.exists():
+            for r in csv.DictReader(cfile.open(encoding="utf-8")):
+                for v, gp in gpat.items():
+                    m = gp.match(r["local_variant"])
+                    if m and r["check"] == "oracle":
+                        st = int(m.group(1) or 0)
+                        area[(shot, r["setup"], v, st, "直接")][int(r["target"])] = float(r["core_frac_fg"])
+                        area[(shot, r["setup"], v, st, "oracle")][int(r["target"])] = float(r["paste_frac_fg"])
+        for meta in (work / "gs").glob(f"*/gs_tok{main_v}{size}_*_al_tto*_local/meta.json"):
             m = json.loads(meta.read_text(encoding="utf-8"))
             setup = meta.parts[-3]
             if m.get("tto"):
                 times[(shot, setup)] = {e["iter"]: e["time_s"] for e in m["tto"]["log"] if "time_s" in e}
                 times[(shot, setup)]["box"] = (m["tto"]["log"][0].get("box") or {}).get("area_frac")
                 times[(shot, setup)]["encode"] = m.get("time_encode_s")
+                times[(shot, setup)]["window"] = (m.get("window") or [None, None, None])[2]
         tf = work / "timing.json"
         if tf.exists():
             times[(shot, "steps")] = json.loads(tf.read_text(encoding="utf-8"))
@@ -158,56 +175,78 @@ def summarize(root, shots, base):
     def cell(a, nd=4):
         return f"{a[0]:.2f} / {a[1]:.{nd}f}" if a else "—"
 
+    def name(stage):
+        return "纯光流" if stage == "flow" else ("前馈 FF" if stage == 0 else f"TTO {stage} 步")
+
+    def not_worse(d, fl, ks):
+        return sum(d[(k, "fg")][0] >= fl[(k, "fg")][0] - 1e-6 and d[(k, "fg")][1] <= fl[(k, "fg")][1] + 1e-6
+                   for k in ks if (k, "fg") in fl and (k, "fg") in d)
+
     lines = ["# 六路数据集：局部 GS 验证汇总", "",
-             f"token 变体 {variant}、`_al` 对齐域；PSNR / LPIPS 为各目标视点平均；"
-             "不差目标数 = fg 的 PSNR 不低于且 LPIPS 不高于纯光流的目标数；oracle 只贴 core ∩ 真值失败区（诊断用）。"
-             "object = 真值中最大的高饱和色块膨胀 40 px（没有彩色物体的场景为空，记为 —）。", ""]
+             f"token 变体 {', '.join(variants)}，`_al` 对齐域；PSNR / LPIPS 为各目标视点平均；"
+             "不差目标数 = fg 的 PSNR 不低于且 LPIPS 不高于纯光流的目标数；贴回区 = 实际贴回面积占前景比例；"
+             "oracle 只贴 core ∩ 真值失败区（诊断用）。object = 真值中最大的高饱和色块膨胀 40 px"
+             "（没有彩色物体的场景为空，记为 —）。", ""]
     setups = sorted({k[1] for k in per})
-    stages = sorted({k[2] for k in per if k[2] != "flow"})
+    stages = sorted({k[3] for k in per if k[3] != "flow"})
+    rows = [("flow", "—")] + [(s, h) for s in stages for h in ("直接", "oracle")]
     for setup in setups:
-        lines += [f"## {setup}", "", "| 场景 | 方法 | 贴回 | fg PSNR / LPIPS | object PSNR / LPIPS | rest PSNR | 不差目标数 | TTO 累计耗时 |",
+        lines += [f"## {setup}：全部场景合计（每个目标视点等权）", "",
+                  "| token 变体 | 方法 | 贴回 | 贴回区 | fg PSNR / LPIPS | object PSNR / LPIPS | rest PSNR | 不差目标数 |",
                   "|---|---|---|---:|---:|---:|---:|---:|"]
-        pooled = defaultdict(dict)
-        for shot in shots:
-            fl = per.get((shot, setup, "flow", "—"))
-            if not fl:
-                continue
-            for stage, how in [("flow", "—")] + [(s, h) for s in stages for h in ("直接", "oracle")]:
-                d = per.get((shot, setup, stage, how))
+        for v in variants:
+            for stage, how in rows:
+                if stage == "flow" and v != variants[0]:
+                    continue
+                d, fl, pa = {}, {}, []
+                for shot in shots:
+                    fs = per.get((shot, setup, v, "flow", "—"), {})
+                    ds = per.get((shot, setup, v, stage, how), {})
+                    d.update({((shot, k), r): x for (k, r), x in ds.items()})
+                    fl.update({((shot, k), r): x for (k, r), x in fs.items()})
+                    pa += list(area.get((shot, setup, v, stage, how), {}).values())
                 if not d:
                     continue
-                pooled[(stage, how)].update({(shot, k, r): v for (k, r), v in d.items()})
                 ks = sorted({k for (k, r) in d if r == "fg"})
-                ok = sum(d[(k, "fg")][0] >= fl[(k, "fg")][0] - 1e-6 and d[(k, "fg")][1] <= fl[(k, "fg")][1] + 1e-6
-                         for k in ks if (k, "fg") in fl)
-                name = "纯光流" if stage == "flow" else ("前馈 FF" if stage == 0 else f"TTO {stage} 步")
-                tt = times.get((shot, setup), {}).get(stage) if stage not in ("flow", 0) else None
                 rest = avg(d, "rest")
-                lines.append(f"| {shot} | {name} | {how} | {cell(avg(d, 'fg'))} | {cell(avg(d, 'object'))} | "
-                             f"{f'{rest[0]:.2f}' if rest else '—'} | {'—' if stage == 'flow' else f'{ok}/{len(ks)}'} | "
-                             f"{f'{tt:.2f} s' if tt is not None else '—'} |")
-        lines += ["", f"### {setup}：全部场景合计（每个目标视点等权）", "",
-                  "| 方法 | 贴回 | fg PSNR / LPIPS | object PSNR / LPIPS | rest PSNR | 不差目标数 |", "|---|---|---:|---:|---:|---:|"]
-        fl = pooled.get(("flow", "—"), {})
-        for (stage, how), d in sorted(pooled.items(), key=lambda x: (x[0][0] != "flow", x[0][0] if x[0][0] != "flow" else -1, x[0][1])):
-            dd = {((s, k), r): v for (s, k, r), v in d.items()}
-            ks = sorted({(s, k) for (s, k, r) in d if r == "fg"})
-            ok = sum(d[(s, k, "fg")][0] >= fl[(s, k, "fg")][0] - 1e-6 and d[(s, k, "fg")][1] <= fl[(s, k, "fg")][1] + 1e-6
-                     for (s, k) in ks if (s, k, "fg") in fl)
-            name = "纯光流" if stage == "flow" else ("前馈 FF" if stage == 0 else f"TTO {stage} 步")
-            rest = avg(dd, "rest")
-            lines.append(f"| {name} | {how} | {cell(avg(dd, 'fg'))} | {cell(avg(dd, 'object'))} | "
-                         f"{f'{rest[0]:.2f}' if rest else '—'} | {'—' if stage == 'flow' else f'{ok}/{len(ks)}'} |")
+                lines.append(f"| {'—' if stage == 'flow' else v} | {name(stage)} | {how} | "
+                             f"{f'{np.mean(pa) * 100:.1f}%' if pa else '—'} | {cell(avg(d, 'fg'))} | "
+                             f"{cell(avg(d, 'object'))} | {f'{rest[0]:.2f}' if rest else '—'} | "
+                             f"{'—' if stage == 'flow' else f'{not_worse(d, fl, ks)}/{len(ks)}'} |")
+        lines += ["", f"## {setup}：逐场景", "",
+                  "| 场景 | token 变体 | 方法 | 贴回 | 贴回区 | fg PSNR / LPIPS | object PSNR / LPIPS | rest PSNR | 不差目标数 | TTO 累计耗时 |",
+                  "|---|---|---|---|---:|---:|---:|---:|---:|---:|"]
+        for shot in shots:
+            for v in variants:
+                fl = per.get((shot, setup, v, "flow", "—"))
+                if not fl:
+                    continue
+                for stage, how in rows:
+                    if stage == "flow" and v != variants[0]:
+                        continue
+                    d = per.get((shot, setup, v, stage, how))
+                    if not d:
+                        continue
+                    ks = sorted({k for (k, r) in d if r == "fg"})
+                    pa = list(area.get((shot, setup, v, stage, how), {}).values())
+                    tt = times.get((shot, setup), {}).get(stage) if stage not in ("flow", 0) else None
+                    rest = avg(d, "rest")
+                    lines.append(f"| {shot} | {'—' if stage == 'flow' else v} | {name(stage)} | {how} | "
+                                 f"{f'{np.mean(pa) * 100:.1f}%' if pa else '—'} | {cell(avg(d, 'fg'))} | "
+                                 f"{cell(avg(d, 'object'))} | {f'{rest[0]:.2f}' if rest else '—'} | "
+                                 f"{'—' if stage == 'flow' else f'{not_worse(d, fl, ks)}/{len(ks)}'} | "
+                                 f"{f'{tt:.2f} s' if tt is not None else '—'} |")
         lines.append("")
-    lines += ["## 耗时", "", "| 场景 | 设置 | 编码 | 监督框面积 | TTO 各检查点累计 | 各步骤墙钟时间 |", "|---|---|---:|---:|---|---|"]
+    lines += ["## 耗时", "", "| 场景 | 设置 | 编码窗口边长 | 编码 | 监督框面积 | TTO 各检查点累计 | 各步骤墙钟时间 |",
+              "|---|---|---:|---:|---:|---|---|"]
     for (shot, setup), t in sorted(times.items()):
         if setup == "steps":
             continue
-        cps = ", ".join(f"{it}: {v:.2f}s" for it, v in sorted((k, v) for k, v in t.items() if isinstance(k, int)))
+        cps = ", ".join(f"{it}: {x:.2f}s" for it, x in sorted((k, x) for k, x in t.items() if isinstance(k, int)))
         st = times.get((shot, "steps"), {})
-        lines.append(f"| {shot} | {setup} | {t.get('encode') or float('nan'):.2f} s | "
+        lines.append(f"| {shot} | {setup} | {t.get('window') or '—'} | {t.get('encode') or float('nan'):.2f} s | "
                      f"{(t.get('box') or float('nan')) * 100:.0f}% | {cps} | "
-                     + ", ".join(f"{k} {v:.0f}s" for k, v in st.items()) + " |")
+                     + ", ".join(f"{k} {x:.0f}s" for k, x in st.items()) + " |")
     root.mkdir(parents=True, exist_ok=True)
     (root / "summary_all.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
     print(f"done -> {root / 'summary_all.md'}")
