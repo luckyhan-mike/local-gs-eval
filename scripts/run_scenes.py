@@ -104,7 +104,7 @@ def main():
                 t = calib_t(calib, ctx, targets)
                 (work / "poses").mkdir(exist_ok=True)
                 with open(work / "poses" / f"{setup}.json", "w", encoding="utf-8") as f:
-                    json.dump({"context": ctx, "targets": targets, "t_pose": t, "source": "calibrated centres"},
+                    json.dump({"context": ctx, "targets": targets, "t_pose": t, "source": "calibrated centres (evaluation only: defines where the held-out camera is)"},
                               f, indent=1)
                 print(f"[{shot}] {setup}: t from calibration {t}")
             timing = {}

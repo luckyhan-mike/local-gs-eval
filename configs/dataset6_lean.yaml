@@ -13,7 +13,8 @@ aligned_size: [1920, 1088]
 
 dataset6:
   root: datasets                                    # 原图目录（data_root 下）；标定与单应矩阵在 datasets_1080/calib
-  calib: datasets_1080/calib/calib_1920x1080.json   # 用标定光心算插值时刻 t（目标光心投影到两侧输入光心连线上），不用目标图
+  calib: datasets_1080/calib/calib_1920x1080.json   # 仅用于评估：用标定光心定出被抽掉的真实相机在哪个 t（目标光心投影到两侧输入光心连线上），
+                                                    # 即评估要生成的目标视点位置；光流和 GS 用同一个 t。方法本身（token、GS 位姿、贴回）不用标定
   work_root: work/dataset6                          # 每组场景的工作目录 = work_root/<scene>_<shot>
   shots:                                            # 从宫格图挑的：手、抱枕、小物件挡在人前，或人离相机很近
     - changjing/shot_0007      # 抱枕举在脸前（大面积前景遮挡）
