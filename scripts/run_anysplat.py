@@ -26,6 +26,9 @@ full crop resolution (lgs/tto.py); each checkpoint is rendered like the feed-for
 suffix _tto<iterations> before _local (e.g. gs_tokrife448_nat_dil_al_tto300_local).
 Round 11 (gs.tto.crop): supervision only inside a box around the trainable Gaussians, early checkpoints,
 wall time per checkpoint in meta.json (tto.log[*].time_s).
+Round 12 (lean): gs.local_variants limits local renders and TTO to the deployed token variant (window
+unchanged), gs.render_full: false skips the full-window renders, gs.tto.crop.per_view gives every input
+view its own box.
 """
 import argparse
 import sys
@@ -379,11 +382,15 @@ def main():
                         print(f"[{setup}] token 变体 {v} 在所有输入相机上都没有标记：不触发 GS，等价于纯光流")
                 if not live:
                     continue
+                # gs.local_variants (round 12): only these variants get local renders / TTO; the encode window
+                # still covers every detected variant, so the Gaussians match the earlier rounds.
+                lv = gcfg.get("local_variants")
+                sel = {v: ts for v, ts in live.items() if not lv or v in lv}
                 if gcfg.get("token_window", "fixed") == "fixed":
                     union = [np.logical_or.reduce([ts["recon"][i] for ts in live.values()]) for i in range(len(ctx))]
-                    jobs.append((crop, "tok", union, {f"tok{v}": (v, ts) for v, ts in live.items()}))
+                    jobs.append((crop, "tok", union, {f"tok{v}": (v, ts) for v, ts in sel.items()}))
                 else:
-                    jobs += [(crop, f"tok{v}", ts["recon"], {f"tok{v}": (v, ts)}) for v, ts in live.items()]
+                    jobs += [(crop, f"tok{v}", ts["recon"], {f"tok{v}": (v, ts)}) for v, ts in sel.items()]
             else:
                 prim = token_sets.get(tcfg.get("primary")) if token_sets else None
                 jobs.append((crop, crop, None, {crop: (tcfg.get("primary"), prim)} if prim else {}))
@@ -495,7 +502,8 @@ def main():
                                       filter3d_var=gcfg["filter3d_var"], filter3d_comp=gcfg.get("filter3d_comp", False))
                             tail = f"{size}_{rv['name']}{POSE_SUFFIX[src]}"
                             # full: all Gaussians of the crop; local: only the token reconstruction region
-                            outputs = {f"{base}_{rv['name']}{POSE_SUFFIX[src]}{stage}": (None, None, None, None)}
+                            outputs = ({f"{base}_{rv['name']}{POSE_SUFFIX[src]}{stage}": (None, None, None, None)}
+                                       if gcfg.get("render_full", True) or not keeps else {})
                             for lab, (tv, kr, kc) in keeps.items():
                                 outputs[f"gs_{lab}{tail}{stage}_local"] = (tv, kr, kc, local_counts[lab])
                             for variant, (tok_variant, kp, kp_core, counts) in outputs.items():

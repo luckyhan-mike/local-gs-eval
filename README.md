@@ -14,7 +14,79 @@
 
 ---
 
-## 0. 第十一轮：测试时优化提速（当前主实验）
+## 0. 第十二轮：精简实验 + 逐视图裁剪 TTO（当前主实验，配置 `configs/mofang_9cam_lean.yaml`）
+
+第十一轮结论：
+- **质量**：TTO 在 100 步左右就基本到顶。cam3 只要 50 步（3.5 s）就 6/6 不差；cam5 要 200 步（24.5 s）才 3/4 不差。300 步的质量与第十轮持平，说明裁剪监督不掉质量。
+- **速度**：裁剪框仍占视图的 96% / 91%，每步耗时没有下降，提速只来自少跑步数。框这么大，是因为可训练高斯取的是全部 5 个 token 变体（含很松的 r5）重建区的并集；另外所有视图共用同一个框尺寸。
+
+**精简**：前十一轮已经有结论的对照分支和诊断不再跑，只保留部署方法和必要的对照。完整配置 `mofang_9cam.yaml` 及其代码不动，换新 token 等情况下仍可跑全套。
+
+| 去掉的内容 | 依据 |
+|---|---|
+| token 变体 r5 / strict / rife_g / strict_g 的局部渲染与 TTO | rife 最好；gate 变体在有 TTO 后反而切掉增益；r5 太松（编码窗口仍按全部变体的并集，与前几轮相同） |
+| `_alv` 位姿（用目标图估计） | 只是对照，部署时不可用 |
+| 整窗口 GS 渲染、真值配准（+reg）、环带配准（ringreg） | 早期诊断，已有结论 |
+| w20 目标侧复核 | 第八轮：与不复核几乎相同（oracle 上限保留） |
+| 其余光流变体（s0.5、uniform、oracle t）的评估、风险阈值扫描 | 光流与 token 自第七轮起固定 |
+| TTO 25 / 300 步 | 第十一轮：25 步不够，100 步后几乎不再提升 |
+
+保留的内容：
+- 两组相机 cam3 / cam5；
+- 参考光流；
+- 方法：rife、`_al`、直接贴回，阶段为前馈和 TTO 50 / 100 / 200 步，每个都附 oracle 上限；
+- 指标：fg / object / rest 等区域的 PSNR 和 LPIPS、不差目标数、逐目标明细、耗时。
+
+TTO 输入 PSNR 只在监督框内计算；SSIM 指标仍照常计算。
+
+**提速**（`gs.tto.crop.per_view: true`）：
+- 可训练高斯只来自 rife（`gs.local_variants: [rife]`）。
+- 每个输入视图按自己的投影外接框（加 32 px 余量）单独光栅化和监督，不再共用一个框尺寸。
+- 日志中 `supervised box` 打印的是最大框尺寸和各视图平均面积占比；各视图的框写在 `meta.json` 的 `tto.log[0].box.per_view`。
+
+跑法（新主机的准备见下一节；token 等沿用第七轮）：
+
+```bash
+export LGS_WORK_DIR=work/round12 HF_HUB_OFFLINE=1 PYTHONUNBUFFERED=1
+mkdir -p $LGS_WORK_DIR && cp -r work/round7/{prepare,flow,poses,tokens,compat_packages} $LGS_WORK_DIR/
+python -m unittest discover -s tests -v
+python scripts/run_anysplat.py --config configs/mofang_9cam_lean.yaml 2>&1 | tee $LGS_WORK_DIR/1_anysplat.log
+python scripts/evaluate.py --config configs/mofang_9cam_lean.yaml 2>&1 | tee $LGS_WORK_DIR/3_evaluate.log
+python scripts/validate_results.py configs/mofang_9cam_lean.yaml
+```
+
+先看 `summary.md` 的"测试时优化：步数–耗时–质量"表，再看"颜色来源对比"表（只有 rife，含 oracle）。
+
+判断标准：
+1. **提速**：监督框面积占比明显低于 96% / 91%；每步耗时 = 累计耗时 / 步数，与第十一轮的 70 / 123 ms 比。换了 4090，可用日志里的编码时间（3090 上 0.83 / 0.52 s）估计两台机器本身的速度差。
+2. **质量不变**：rife 前馈与 TTO 100 / 200 步应与第十一轮接近（cam3 TTO200 27.33 / 0.0460；cam5 TTO200 29.15 / 0.0382）。
+3. **最少步数**：cam3 和 cam5 最早在哪个检查点达到 6/6、3/4，以及对应的每帧耗时。
+4. **流程总耗时**：从 GS 到评估完，应在十几分钟内。
+
+## 0.a 新主机（例如 4090）准备
+
+需要从旧主机或网上拿到下面这些（`data_root` 默认 `/home/han/linux-han`，也可以用环境变量 `LGS_DATA_ROOT` 指定）：
+
+1. **代码**：`git clone` 本仓库。
+2. **数据集**：`北极星/0/魔方_9/grid_00~08.png`（原图）和 `北极星/1/魔方_9/aligned_grid_00~08.png`（对齐图），放在 `data_root` 下。
+3. **AnySplat 源码**：`data_root/AnySplat/`。
+4. **AnySplat 权重**：Hugging Face 缓存 `~/.cache/huggingface/hub/models--lhjiang--anysplat/`（使用 `HF_HUB_OFFLINE=1` 时必需）。新主机能联网的话，也可以不设 `HF_HUB_OFFLINE`，让它自动下载。
+5. **LPIPS 用的 AlexNet 权重**：`~/.cache/torch/hub/checkpoints/alexnet-owt-7be5be79.pth`（没有的话首次评估会自动下载）。
+6. **第七轮的复用输入**：`local-gs-eval/work/round7/{prepare,flow,poses,tokens,compat_packages}`，放到新主机同一路径。其中 `compat_packages` 是 e3nn 0.5.6 兼容包。这样光流基线和 token 与前几轮逐位一致，验证脚本会核对。
+7. **Practical-RIFE**：`data_root/Practical-RIFE/train_log/{IFNet_HDv3.py,flownet.pkl}`。只有重新跑光流或 token 时才需要，本轮用不到，建议一并拷贝。
+8. **conda 环境**：建议在旧主机上用 `conda pack -n gspl -o gspl.tar.gz` 打包，在新主机解压到 `~/anaconda3/envs/gspl` 后执行 `bin/conda-unpack`。这样得到的是同一套 Python 3.9、torch 2.0.1+cu117、gsplat 1.5.3。
+   - 4090 能直接运行 cu117 的 torch，但需要较新的 NVIDIA 驱动（≥ 525）。
+   - gsplat 首次运行如果要重新编译 CUDA 扩展：需要 CUDA 11.7 的 nvcc，并先 `export TORCH_CUDA_ARCH_LIST="8.6+PTX"`（nvcc 11.7 不认识 4090 的 8.9 架构；8.6 的代码可以直接在 4090 上运行）。
+   - 也可以把旧主机的 `~/.cache/torch_extensions/` 一起拷过去。
+
+自检：
+
+```bash
+python -c "import torch, gsplat; print(torch.cuda.get_device_name(0), torch.__version__, gsplat.__version__)"
+python -m unittest discover -s tests -v
+```
+
+## 0.0 第十一轮：测试时优化提速
 
 第十轮结论：TTO 第一次让局部 GS 在两组上都超过纯光流（rife、`_al`、直接贴回、300 步：cam3 27.20 / 0.0470，6/6 不差；cam5 29.03 / 0.0390，3/4 不差）。1000 步留出视点反而变差（过拟合）。但耗时太长：前馈编码 0.5–0.8 s，TTO 到 1000 步 cam3 75 s、cam5 138 s，约每步 75 / 138 ms。慢的原因是每一步都把全部 3/5 个输入视图在约 911² 全图上渲染并反传，而真正优化的只是 token 区附近的高斯。
 
@@ -43,7 +115,7 @@ python scripts/validate_results.py configs/mofang_9cam.yaml
 3. 最少步数：25 / 50 / 100 步里，最早在哪一步两组的 fg 均值就超过纯光流、不差目标数达到第十轮 300 步的水平；它对应的耗时就是每帧的实际额外开销。
 4. 如果裁剪后仍然慢（比如监督框占视图 50% 以上），下一步考虑降监督分辨率（`max_res`）或每步只随机取一个输入视图。
 
-## 0.0000 第十轮：局部 GS 测试时优化
+## 0.00000 第十轮：局部 GS 测试时优化
 
 第九轮结论：从输入原图取纹理，两条路线都明显差于直接用 GS 颜色（cam3 rife：GS 颜色 26.38 / 0.0537；GS 几何 + 输入纹理 23.48 / 0.0908；VGGT 几何 + 输入纹理 24.52 / 0.0997；object LPIPS 从 0.16 恶化到 0.40）。原因有两点：
 - GS / VGGT 几何用来做对齐足够准，但按像素取色不够准。魔方色块边缘锐利，深度差 1–2 px（448 分辨率）就会取到相邻色块，出现"清晰但位置错"的纹理，而 LPIPS 对错位的惩罚比对模糊更重。

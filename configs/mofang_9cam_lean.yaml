@@ -1,0 +1,120 @@
+# 魔方场景：9 路水平会聚相机阵列（北极星/0 原图，北极星/1 单应对齐图）
+# 第十二轮起的精简配置：只跑部署方法（token 变体 rife、_al 对齐域、直接贴回）及其 oracle 上限、
+# 前馈 + 少数 TTO 检查点；已有结论的对照分支与诊断全部关闭（见 README 第 0 节）。完整对照用 mofang_9cam.yaml。
+# 所有相对路径都相对于 data_root；可用环境变量 LGS_DATA_ROOT 覆盖 data_root。
+data_root: /home/han/linux-han          # 对应 Windows 上的 D:\hb，按实际挂载位置修改
+work_dir: work                          # 输出目录（相对于本仓库根目录，或写绝对路径）
+
+num_cams: 9
+raw_pattern: "北极星/0/魔方_9/grid_{:02d}.png"            # 会聚相机原图（AnySplat 输入）
+aligned_pattern: "北极星/1/魔方_9/aligned_grid_{:02d}.png" # 单应对齐到中心相机后的图（光流输入/真值）
+
+rife_dir: Practical-RIFE                # 需包含 train_log/IFNet_HDv3.py 与 train_log/flownet.pkl
+anysplat_dir: AnySplat                  # AnySplat 源码根目录
+anysplat_ckpt: lhjiang/anysplat         # HF 仓库名或本地目录
+
+# 留一法设置：context 为输入相机，区间内其余相机作为真值目标
+setups:
+  cam3: {context: [0, 4, 8]}            # 与 2-3/魔方_9 实验一致（大基线）
+  cam5: {context: [0, 2, 4, 6, 8]}      # 中等基线对照
+
+chroma:                                 # 绿幕抠像（OpenCV HSV，H∈[0,180]）
+  h_lo: 35
+  h_hi: 90
+  s_min: 50
+  v_min: 30
+  min_area_frac: 0.002
+
+tokens:                                 # 输入相机上的不可靠区域检测（scripts/detect_tokens.py，不使用真值）
+  rife_scale: 1.0
+  dis_preset: medium                    # 源图像之间的双向光流（OpenCV DIS）；RIFE 端点 t=0/1 的光流不可用
+  fb_thresh: 3.0                        # DIS 前后向不一致阈值（像素）= fb_thresh + fb_rel·|F|
+  fb_rel: 0.2
+  photo_thresh: 0.08                    # 光度残差（0~1，通道均值）；遮挡需同时满足前后向不一致与光度不一致
+  depth_thresh: 2.0                     # RIFE t=0.5 视差的水平梯度（像素/像素），沿 RIFE 对应关系映射回源图像；只取大的深度跳变（魔方 vs 头发），0.5 时脸/衣服轮廓全被标记
+  fg_dilate_px: 15                      # 只在前景附近标记
+  core_dilate_px: 6                     # token 核心区（贴回区）在原始标记外的膨胀
+  recon_margin_px: 48                   # 重建区 = 核心区再外扩，用于保证 GS 在 token 周围也重建准确
+  crop_pad_px: 32                       # token 裁剪窗口在重建区外接框外的边距
+  paste_feather_px: 8                   # 贴回羽化宽度（落在重建边距内，双方都可靠的区域）
+  ring_px: 24                           # 环带配准：在贴回区外这一圈用光流结果做参考（不用真值）
+  primary: rife                         # center 等非 token 裁剪的局部高斯用哪个变体
+  variants:                             # 每个变体输出 tokens/<setup>/<name>/pair{a}-{b}/（逐对，用于贴回）和并集；GS 只编码一次（gs.token_window）
+    r5:       {use_dis: true,  rife_warp: 0.08, rife_col: 2.0,    depth: any,       min_cc_px: 0}   # 第五轮设置（对照）
+    rife:     {use_dis: false, rife_warp: 0.20, rife_col: 6.0,    depth: near_fail, min_cc_px: 150} # 只用 RIFE 失败信号，深度跳变须挨着失败处
+    strict:   {use_dis: false, rife_warp: 0.25, rife_col: 1.0e+9, depth: "off",    min_cc_px: 300} # 只用 |W0-W1|，最保守
+    rife_g:   {use_dis: false, rife_warp: 0.20, rife_col: 6.0,    depth: near_fail, min_cc_px: 150, pair_gate: 0.03} # rife + 逐对触发门限
+    strict_g: {use_dis: false, rife_warp: 0.25, rife_col: 1.0e+9, depth: "off",    min_cc_px: 300, pair_gate: 0.03} # strict + 逐对触发门限
+  # pair_gate：某相机对的 core 占前景比例（两台相机平均）低于该值时，该对之间的虚拟视点不触发 GS（=纯光流）。
+  # 0.03 是初值（第六轮 cam5 oracle_fail 仅占前景 4.2%）；逐目标表会列出每对的 core 面积，便于事后定门限。
+  ring_max_disp_px: 20                  # 环带配准位移超过该值视为不可信，退回直接贴回
+  paste_fg_dilate_px: 15                # 贴回只在光流结果前景（绿幕抠像）附近进行，不用真值
+
+calib:                                  # 离线阵列标定（第三轮负面结果：单块正对棋盘格下旋转-平移退化，t 误差 0.06；默认不使用）
+  board_pattern: "北极星/biao_ding_9/grid_{:02d}.png"      # 同一阵列拍摄的棋盘格原图
+  board_inner: [11, 8]                  # 内角点数（12x9 格）
+  square_size: 1.0                      # 世界单位 = 1 格
+  pair_max_gap: 4                       # 场景匹配只在序号差 <= 4 的相机对之间做
+  max_matches_per_pair: 600
+  triangulate_max_err_px: 4.0
+  per_cam_focal: false                  # 9 台同型号相机共享焦距；单独估计时焦距与深度耦合、散布 3%（不稳定）
+  huber_px: 1.5
+
+gs:
+  sizes: [448]                          # AnySplat 训练分辨率；上一轮 518 的输入视点自渲染明显退化
+  crops: [token]                        # token: 输入相机 token 重建区外接框（第四轮主设置）；center: 中心 1080x1080（整窗口对照）；roi/fg 保留可选
+  roi_pad_px: 80                        # ROI 在魔方外接框四周的边距（覆盖手和遮挡带）
+  roi_min_side: 448                     # ROI 最小边长（不小于输入分辨率，避免下采样以外的放大）
+  roi_window: null                      # 手动指定 [x0, y0, side] 可跳过自动检测
+  filter3d_var: 0.2                     # Mip-Splatting 3D 平滑滤波方差系数 s（σ² = s·(d/f)²）
+  filter3d_comp: false                  # 3D 滤波的不透明度能量补偿；AnySplat 的扁平高斯会被压成透明（第二轮），默认关闭
+  pose_sources: [aligned_int]          # 精简：_alv 用目标图估计位姿，只是对照
+  aligned_ref: 4                        # 对齐参考相机（单应 H 近似相似变换的那台，即中心相机）
+  aligned_pad_px: 160                   # 对齐域渲染画布四周的余量（平面单应会平移画面）
+  local_variants: [rife]                # 精简：只对部署变体做局部渲染与 TTO；编码窗口仍按全部变体的并集，与前几轮相同
+  render_full: false                    # 精简：不渲染整窗口 GS（早期诊断）
+  token_window: fixed                   # fixed：所有 token 变体共用一次编码（窗口 = 各变体重建区并集），变体只决定选哪些高斯；per_variant：第六轮做法（每个变体按自己的窗口各编码一次，窗口小时 GS 变差）
+  reproject:                            # 第九轮：几何来自 3D、纹理取自输入原图（lgs/reproject.py），与 GS 颜色贴回用同一 token 贴回区
+    geometries: []                      # 第九轮负面结果（几何不够准，纹理错位），本轮关闭；[gs, vggt] 可恢复
+    sources: [aligned_int]              # 只做可部署的对齐域、光心按 t 插值
+    vis_tol: 0.05                       # 输入相机可见性：点深度 ≤ 该相机深度图 ×(1+vis_tol)
+    splat_scale: null                   # vggt 点前向投影的分辨率比例；null = 448/窗口边长（点密度约每像素 1 个）
+  tto:                                  # 第十轮：局部 GS 测试时优化（lgs/tto.py），以前馈高斯为初值，在输入视点全分辨率裁剪上优化
+    checkpoints: [50, 100, 200]         # 精简：第十一轮 100 步后几乎不再提升
+    crop:                               # 第十一轮提速：只在可训练高斯投影的外接框（+边距）内渲染与监督，不再渲染整幅输入视图
+      enabled: true
+      margin_px: 32                     # 外接框四周余量（监督分辨率下的像素）
+      per_view: true                    # 第十二轮：每个输入视图用自己的外接框、单独光栅化
+      quantile: 0.002                   # 投影点取 0.2%~99.8% 分位，去掉离群高斯
+    scope: local                        # local：只优化 token 重建区（各变体并集）的高斯；all：优化窗口内全部高斯
+    max_res: 1008                       # 监督分辨率上限（窗口约 911 px 时即原分辨率）
+    sh_rest: false                      # 只优化 SH 直流项；输入视点少，高阶 SH 容易过拟合视角相关颜色
+    ssim_weight: 0.2                    # loss = 0.8·L1 + 0.2·(1−SSIM)
+    lr: {means: 1.6e-4, cov: 5.0e-3, opacity: 2.5e-2, dc: 2.5e-3}   # means 再乘输入相机基线长度（3DGS 默认量级）
+  keep_mode: visible                    # 局部高斯：visible=输入相机中深度测试后的可见表面；ray=视线穿过即保留（第四轮，足迹过大）
+  visible_tol: 0.03                     # 可见性深度容差（相对）
+  renders:                              # 每个 (crop, size) 只编码一次；第二、三轮滤波核差异 <0.1 dB，只保留 nat_dil
+    - {name: nat_dil,   res: native, mode: classic,     eps2d: auto, filter3d: false}  # 原生分辨率渲染，膨胀按分辨率比例放大
+
+risk:                                   # 光流自身信号 → 风险区域（不使用真值）
+  warp_thresh: 0.08                     # |W0-W1| 通道均值阈值（0~1）
+  col_thresh: 2.0                       # 双向光流共线残差阈值（像素）
+  dilate_px: 9
+  fg_dilate_px: 15
+
+eval:
+  lean: true                            # 精简：只评参考光流，不做风险阈值扫描、环带配准
+  ref_flow: flow_s1.0_pose              # 用于定义风险区域与混合的参考光流（第二轮起：pose t 在两种基线下都更好）
+  fail_err_thresh: 0.08                 # 光流误差 > 该值视为“光流失败”（oracle 区域与 AUC 标签）
+  edge_thresh: 0.3                      # 视差水平梯度阈值（像素/像素）
+  edge_dilate_px: 5
+  feather_sigma: 3.0                    # 混合羽化
+  object_dilate_px: 40                  # 物体级区域：真值中魔方掩码膨胀（含手和魔方周围的遮挡带）
+  reg_min_px: 2000                      # GS 配准诊断所需的最少前景像素
+  sweep_warp: [0.06, 0.08, 0.10, 0.12, 0.15, 0.20, 0.25, 0.30, 0.40]   # 风险阈值扫描（|W0-W1|）
+  sweep_col: [2.0, 3.0, 4.0, 6.0, 1.0e+9]                 # 共线残差阈值，1e9 表示不用该信号
+  # 第八轮：目标侧光流风险复核。贴回区 = token core ∩ 参考光流在实际 t 下的风险区（|W0-W1| > warp 或共线残差 > col，
+  # 外扩 dilate_px，限制在光流结果抠像前景附近；不用真值）。每项生成 hyb_tokchk_<name>[v]，另附 oracle（core ∩ 真值失败区）作上限。
+  # 第八轮结论：w06~w20 与不复核几乎相同（光流风险区本来就覆盖 token core），本轮只保留 w20 与 oracle。
+  target_check_suffix: [_al_local, _al_tto50_local, _al_tto100_local, _al_tto200_local]   # 前馈与各 TTO 检查点的 oracle 上限
+  target_check: []                      # 精简：第八轮 w20 与不复核几乎相同；[] = 只做 oracle

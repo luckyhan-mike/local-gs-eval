@@ -19,6 +19,8 @@ Round 11 (speed): with ocfg["crop"] each input view is rendered and supervised o
 the projected trainable Gaussians (plus a margin), instead of the full ~900 px crop; the principal point
 is shifted so the box is an exact sub-window of the full view. The wall time to every checkpoint is
 logged (CUDA synchronised).
+Round 12: with ocfg["crop"]["per_view"] every view gets its own tight box and is rasterised separately
+(one call per view and step), instead of one common box size for all views.
 """
 import time
 from types import SimpleNamespace
@@ -83,6 +85,15 @@ def crop_boxes(means, viewmats, Ks, res, margin, q=0.002):
     return w, h, xy
 
 
+def view_boxes(means, viewmats, Ks, res, margin, q=0.002):
+    """Per-view (x, y, w, h) boxes, each as tight as its own projections allow."""
+    out = []
+    for vm, K in zip(viewmats, Ks):
+        w, h, xy = crop_boxes(means, vm[None], K[None], res, margin, q)
+        out.append((xy[0][0], xy[0][1], w, h))
+    return out
+
+
 def optimize(runner, state, images, res, checkpoints, train_mask, ocfg, eps2d=0.3, mode="classic"):
     """Refine `state["gaussians"]` on the context views. images: context crops (V,res,res,3) float [0,1].
 
@@ -128,7 +139,17 @@ def optimize(runner, state, images, res, checkpoints, train_mask, ocfg, eps2d=0.
     W = H = int(res)
     ccfg = ocfg.get("crop") or {}
     box = None
-    if ccfg.get("enabled") and len(idx):
+    boxes = None  # per-view boxes: list of (x, y, w, h); views are then rasterised one by one
+    if ccfg.get("enabled") and ccfg.get("per_view") and len(idx):
+        boxes = view_boxes(means0[idx], viewmats, Ks, int(res), float(ccfg.get("margin_px", 32)),
+                           float(ccfg.get("quantile", 0.002)))
+        Ks[:, 0, 2] -= torch.as_tensor([b[0] for b in boxes], device=Ks.device, dtype=Ks.dtype)
+        Ks[:, 1, 2] -= torch.as_tensor([b[1] for b in boxes], device=Ks.device, dtype=Ks.dtype)
+        gt_v = [gt[i, y:y + h, x:x + w] for i, (x, y, w, h) in enumerate(boxes)]
+        box = {"per_view": [list(b) for b in boxes],
+               "area_frac": float(np.mean([w * h for (_, _, w, h) in boxes])) / float(res) ** 2,
+               "w": int(max(b[2] for b in boxes)), "h": int(max(b[3] for b in boxes))}
+    elif ccfg.get("enabled") and len(idx):
         W, H, xy = crop_boxes(means0[idx], viewmats, Ks, int(res), float(ccfg.get("margin_px", 32)),
                               float(ccfg.get("quantile", 0.002)))
         Ks[:, 0, 2] -= torch.as_tensor([x for x, _ in xy], device=Ks.device, dtype=Ks.dtype)
@@ -151,12 +172,28 @@ def optimize(runner, state, images, res, checkpoints, train_mask, ocfg, eps2d=0.
     last = max(checkpoints)
     for it in range(1, last + 1):
         means, cov, op, feat = assemble()
-        out, _, _ = runner.rasterization(means, quats0, scales0, op, feat, viewmats, Ks, W, H,
-                                         sh_degree=sh_degree, packed=False, near_plane=1e-10, backgrounds=bg,
-                                         radius_clip=0.1, covars=cov, rasterize_mode=mode, eps2d=float(eps2d))
-        pred = out[..., :3].clamp(0, 1)
-        l1 = (pred - gt).abs().mean()
-        loss = (1 - w_ssim) * l1 + w_ssim * (1 - ssim(pred.permute(0, 3, 1, 2), gt.permute(0, 3, 1, 2)))
+        if boxes is None:
+            out, _, _ = runner.rasterization(means, quats0, scales0, op, feat, viewmats, Ks, W, H,
+                                             sh_degree=sh_degree, packed=False, near_plane=1e-10, backgrounds=bg,
+                                             radius_clip=0.1, covars=cov, rasterize_mode=mode, eps2d=float(eps2d))
+            pred = out[..., :3].clamp(0, 1)
+            l1 = (pred - gt).abs().mean()
+            loss = (1 - w_ssim) * l1 + w_ssim * (1 - ssim(pred.permute(0, 3, 1, 2), gt.permute(0, 3, 1, 2)))
+            mse = ((pred.detach() - gt) ** 2).mean(dim=(1, 2, 3))
+        else:
+            loss, mse = 0.0, []
+            for i, (_, _, w, h) in enumerate(boxes):
+                out, _, _ = runner.rasterization(means, quats0, scales0, op, feat, viewmats[i:i + 1], Ks[i:i + 1],
+                                                 w, h, sh_degree=sh_degree, packed=False, near_plane=1e-10,
+                                                 backgrounds=bg[i:i + 1], radius_clip=0.1, covars=cov,
+                                                 rasterize_mode=mode, eps2d=float(eps2d))
+                pv = out[..., :3].clamp(0, 1)
+                g_ = gt_v[i][None]
+                l1 = (pv - g_).abs().mean()
+                ls = 1 - ssim(pv.permute(0, 3, 1, 2), g_.permute(0, 3, 1, 2))
+                loss = loss + ((1 - w_ssim) * l1 + w_ssim * ls) / nv
+                mse.append(((pv.detach() - g_) ** 2).mean())
+            mse = torch.stack(mse)
         opt.zero_grad(set_to_none=True)
         loss.backward()
         opt.step()
@@ -164,7 +201,7 @@ def optimize(runner, state, images, res, checkpoints, train_mask, ocfg, eps2d=0.
             torch.cuda.synchronize()
         t_it = time.time() - t_start
         if it == 1 or it in checkpoints or it % 100 == 0:
-            mse = ((pred.detach() - gt) ** 2).mean(dim=(1, 2, 3)).clamp(min=1e-10)
+            mse = mse.clamp(min=1e-10)
             e = {"iter": it, "loss": float(loss.detach()), "ctx_psnr": [float(x) for x in -10 * torch.log10(mse)]}
             if it in checkpoints:
                 e["time_s"] = t_it

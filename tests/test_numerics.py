@@ -348,6 +348,17 @@ class NumericsTests(unittest.TestCase):
         self.assertIn("box", log[0])
         self.assertIn("time_s", log[-1])
 
+        # round 12: per-view boxes -> one rasterisation call per view and step, each with its own size
+        state["ctx_c2w"][1, 0, 3] = 0.3
+        g.means[0, :3, 0] = torch.tensor([-0.4, 0.0, 0.4])  # spread in x: per-view boxes differ in position
+        sizes.clear()
+        snaps, log = optimize(CropRunner(), state, np.full((2, 64, 64, 3), 0.2, np.float32), 64, [2], train,
+                              {"crop": {"enabled": True, "per_view": True, "margin_px": 2}})
+        self.assertEqual(len(sizes), 2 * 2)
+        self.assertEqual(len(log[0]["box"]["per_view"]), 2)
+        self.assertLess(log[0]["box"]["area_frac"], 1.0)
+        self.assertEqual(len(log[-1]["ctx_psnr"]), 2)
+
     def test_tto_crop_box_is_exact_subwindow(self):
         import torch
         from lgs.tto import crop_boxes

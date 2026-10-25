@@ -164,6 +164,9 @@ def main():
     paste_rows, token_rows, chk_rows = [], [], []
     tto_info = {}  # setup -> meta["tto"] (one optimisation per encode, shared by all variants)
     checks = ecfg.get("target_check")  # None: no target-side check; []: oracle only
+    # Round 12 eval.lean: only the reference flow, no risk-threshold sweep, no ring registration (the
+    # questions those answered are settled; see README).
+    lean = bool(ecfg.get("lean"))
     ref = ecfg["ref_flow"]
 
     for setup in args.setups or list(cfg["setups"]):
@@ -174,6 +177,8 @@ def main():
         if ref not in flow_vars:
             print(f"[{setup}] 缺少参考光流 {ref}，跳过")
             continue
+        if lean:
+            flow_vars = [ref]
         gs_meta = {gv: load_json(gs_dir / gv / "meta.json") for gv in gs_vars}
         stale = [gv for gv, m in gs_meta.items() if "render" not in m]
         if stale:
@@ -215,7 +220,7 @@ def main():
             for n in SIGNALS:
                 auc_rows.append([setup, k, n, auc(sig[n][fg], label[fg]), float(label[fg].mean())])
         sweep = defaultdict(list)
-        for wt in ecfg["sweep_warp"]:
+        for wt in ([] if lean else ecfg["sweep_warp"]):
             for ct in ecfg["sweep_col"]:
                 for k in targets:
                     b = base[k]
@@ -226,9 +231,12 @@ def main():
         for (wt, ct), v in sweep.items():
             v = np.mean(v, 0)
             sweep_rows.append([setup, wt, ct, *v])
-        best = max(sweep, key=lambda key: np.mean([x[2] for x in sweep[key]]))
+        if sweep:
+            best = max(sweep, key=lambda key: np.mean([x[2] for x in sweep[key]]))
+            print(f"[{setup}] 风险阈值扫描最优（IoU）: warp={best[0]} col={best[1]}")
+        else:
+            best = (rcfg["warp_thresh"], rcfg["col_thresh"])
         tuned[setup] = best
-        print(f"[{setup}] 风险阈值扫描最优（IoU）: warp={best[0]} col={best[1]}")
 
         # ---------- pass 2: all methods
         for k in targets:
@@ -268,7 +276,7 @@ def main():
                     preds[f"hyb_token[{gv}]"] = blend_w(preds[ref], p, tok_w)
                     # GT-free alignment: register the GS patch to the flow result on the reliable ring
                     ring = dilate(core, tcfg["ring_px"]) & ~dilate(core, tcfg["paste_feather_px"]) & (ok > 0)
-                    hmat, rdisp = register(p, preds[ref], ring)
+                    hmat, rdisp = (None, float("nan")) if lean else register(p, preds[ref], ring)
                     if hmat is not None and rdisp > tcfg["ring_max_disp_px"]:
                         hmat = None  # implausible fit (ring too small or flow wrong there): paste unaligned
                     if hmat is not None:
@@ -276,10 +284,11 @@ def main():
                         core2 = warp_by(core.astype(np.float32), hmat) > 0.5
                         preds[f"hyb_token_ringreg[{gv}]"] = blend_w(preds[ref], p2,
                                                                     paste_weight(core2, ok2, tcfg["paste_feather_px"]))
-                    else:
+                    elif not lean:
                         preds[f"hyb_token_ringreg[{gv}]"] = preds[f"hyb_token[{gv}]"]
                     for m in (f"hyb_token[{gv}]", f"hyb_token_ringreg[{gv}]"):
-                        cover[m] = np.ones(gt.shape[:2], bool)
+                        if m in preds:
+                            cover[m] = np.ones(gt.shape[:2], bool)
                     token_rows.append([setup, k, gv, float(core.sum() / max(fg.sum(), 1)), rdisp])
                     suf = ecfg.get("target_check_suffix", "_al_local")
                     if checks is not None and gv.endswith(tuple(suf) if isinstance(suf, list) else suf):
@@ -329,6 +338,8 @@ def main():
                 if not m.any():
                     continue
                 for meth in (ref, f"hyb_token[{gv}]", f"hyb_token_ringreg[{gv}]"):
+                    if meth not in preds:
+                        continue
                     p = preds[meth]
                     sm = ssim_map(p[y0:y1, x0:x1], gt[y0:y1, x0:x1])
                     full = np.full(gt.shape[:2], np.nan, np.float32)
@@ -353,13 +364,15 @@ def main():
 
             local = [g for g in paste if paste[g].any()]
             if local:
-                best_lv = max(local, key=lambda g: psnr(preds[f"hyb_token_ringreg[{g}]"], gt, paste[g]))
+                rr = "hyb_token[{}]" if lean else "hyb_token_ringreg[{}]"
+                best_lv = max(local, key=lambda g: psnr(preds[rr.format(g)], gt, paste[g]))
                 tiles += [tile(best_lv, np.where(paste[best_lv][..., None], preds[best_lv], gt * 0.3), box, 260),
                           tile("hyb_token", preds[f"hyb_token[{best_lv}]"], box, 260),
-                          tile("hyb_token_ringreg", preds[f"hyb_token_ringreg[{best_lv}]"], box, 260),
                           err_tile("|err| flow x3", preds[ref]),
-                          err_tile("|err| hyb_token x3", preds[f"hyb_token[{best_lv}]"]),
-                          err_tile("|err| ringreg x3", preds[f"hyb_token_ringreg[{best_lv}]"])]
+                          err_tile("|err| hyb_token x3", preds[f"hyb_token[{best_lv}]"])]
+                if not lean:
+                    tiles += [tile("hyb_token_ringreg", preds[rr.format(best_lv)], box, 260),
+                              err_tile("|err| ringreg x3", preds[rr.format(best_lv)])]
                 ov = gt.copy()
                 pm = paste[best_lv]
                 ov[pm] = 0.5 * ov[pm] + 0.5 * np.array((0, 0.3, 1), np.float32)

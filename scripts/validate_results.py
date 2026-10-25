@@ -40,13 +40,19 @@ def main():
         tok_vars = [v for v in (cfg.get("tokens", {}).get("variants") or {}) if (tok_root / v).is_dir()]
         labels = [f"tok{v}" for v in tok_vars] if tok_vars else ["token"]
         fixed = gcfg.get("token_window", "fixed") == "fixed" and tok_vars
+        lv = gcfg.get("local_variants")
+        if lv and tok_vars:
+            labels = [f"tok{v}" for v in tok_vars if v in lv]
         tails = [f"{size}_{rv['name']}{suffix[src]}" for size in gcfg["sizes"] for rv in gcfg["renders"]
                  for src in gcfg.get("pose_sources", ["vggt"])]
         variants = []
         for crop in gcfg["crops"]:
             if crop == "token" and fixed:  # one encode: full render gs_tok*, one local render per token variant
-                variants += [f"gs_tok{t}" for t in tails]
+                if gcfg.get("render_full", True):
+                    variants += [f"gs_tok{t}" for t in tails]
                 variants += [f"gs_{lab}{t}_local" for lab in labels for t in tails]
+                for it in (gcfg.get("tto") or {}).get("checkpoints") or []:  # TTO checkpoint renders
+                    variants += [f"gs_{lab}{t}_tto{it}_local" for lab in labels for t in tails]
             else:
                 full = [f"gs_{lab}{t}" for lab in (labels if crop == "token" else [crop]) for t in tails]
                 variants += full + ([v + "_local" for v in full] if tok_root.exists() else [])
