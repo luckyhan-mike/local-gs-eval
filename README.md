@@ -14,6 +14,94 @@
 
 ---
 
+## ★ 新主机（RTX 4090，Linux）从零部署并运行六路数据集实验
+
+本节是完整的操作清单，可以交给自动执行的 AI 按顺序完成。每一步都有检查方法；不满足时停下来报告，不要跳过。
+
+### 第 1 步：确认用户已经手动拷贝的数据（网上下载不到）
+
+`DATA_ROOT` 默认是 `/home/han/linux-han`。如果数据在别处，先执行 `export LGS_DATA_ROOT=<实际路径>`，下面的 `$DATA_ROOT` 都指这个目录。
+
+```bash
+DATA_ROOT=${LGS_DATA_ROOT:-/home/han/linux-han}
+for s in changjing/shot_0007 changjing/shot_0003 changjing1/shot_0012 changjing1/shot_0032 changjing2/shot_0000; do
+  for v in 0 1 2 3 4 5; do test -f "$DATA_ROOT/datasets/$s/view_$v.png" || echo "缺少 $DATA_ROOT/datasets/$s/view_$v.png"; done
+done
+test -f "$DATA_ROOT/datasets_1080/calib/homographies_cam3_raw2304_to_crop1920x1088.npy" || echo "缺少单应矩阵"
+test -f "$DATA_ROOT/datasets_1080/calib/calib_1920x1080.json" || echo "缺少标定 json"
+test -f "$DATA_ROOT/Practical-RIFE/train_log/flownet.pkl" || echo "缺少 RIFE 权重"
+test -f "$DATA_ROOT/Practical-RIFE/train_log/IFNet_HDv3.py" || echo "缺少 RIFE 网络定义"
+test -f "$DATA_ROOT/Practical-RIFE/model/warplayer.py" || echo "缺少 RIFE model/warplayer.py"
+```
+
+如果上面有输出，说明数据没拷全，需要用户从 Windows 主机拷贝（`D:\hb` 对应 `$DATA_ROOT`）：
+- `datasets/` 下的 5 组场景原图（2304×1296，每组约 52 MB）；
+- `datasets_1080/calib/`；
+- `Practical-RIFE/train_log/` 和 `Practical-RIFE/model/`。
+
+`train_log` 和 `flownet.pkl` 必须是同一版本，不要用网上下载的替换。
+
+### 第 2 步：克隆代码
+
+```bash
+cd $DATA_ROOT
+git clone https://github.com/luckyhan-mike/local-gs-eval.git
+git clone https://github.com/InternRobotics/AnySplat.git      # 放在 $DATA_ROOT/AnySplat（配置 anysplat_dir）
+```
+
+### 第 3 步：Python 环境（按 AnySplat 官方方式，Python 3.10 + torch 2.2 + CUDA 12.1，支持 4090）
+
+```bash
+conda create -n gspl python=3.10 -y
+conda activate gspl
+pip install torch==2.2.0 torchvision==0.17.0 --index-url https://download.pytorch.org/whl/cu121
+cd $DATA_ROOT/AnySplat && pip install -r requirements.txt     # 含 gsplat 预编译包、lpips、e3nn、xformers 等
+pip install pyyaml scipy scikit-image opencv-python
+```
+
+- `requirements.txt` 里的 pytorch3d 需要从源码编译。如果失败可以先跳过，本实验不调用 pytorch3d：删掉那一行后重新安装。
+- 不要让 pip 把 torch 升级到别的版本。若被升级，重新执行上面安装 torch 的那一行。
+
+检查：
+
+```bash
+python -c "import torch, gsplat, lpips; print(torch.cuda.get_device_name(0), torch.__version__, gsplat.__version__)"
+```
+
+应打印出 4090 和版本号。
+
+### 第 4 步：单元测试
+
+```bash
+cd $DATA_ROOT/local-gs-eval
+python -m unittest discover -s tests -v       # 17 项应全部通过
+```
+
+### 第 5 步：运行实验（5 组场景，每组依次跑 prepare → token → GS+TTO → 光流 → 评估 → 验证）
+
+```bash
+cd $DATA_ROOT/local-gs-eval
+export PYTHONUNBUFFERED=1            # 第一次运行不要设置 HF_HUB_OFFLINE，让 AnySplat 权重自动下载
+mkdir -p work
+python scripts/run_scenes.py --config configs/dataset6_lean.yaml 2>&1 | tee work/dataset6_run.log
+```
+
+- 中途失败：看 `work/dataset6/<场景>_<shot>/logs/<步骤>.log`。修好后可以从失败的步骤接着跑，例如 `--shots changjing/shot_0007 --steps anysplat flow evaluate validate`。
+- 只重新生成汇总：加 `--summary-only`。
+- 如果 TTO 一步报错，或者显存不足，把日志交给用户，不要擅自改算法参数。
+
+### 第 6 步：上传结果
+
+结果汇总在 `work/dataset6/summary_all.md`。上传到结果仓库 https://github.com/hhan70701/local-gs-eval-results 的新分支 `experiment/dataset6-in035-<日期>`，放在目录 `results/dataset6-in035-<日期>/` 下。
+
+要上传的内容：
+- `summary_all.md`、`dataset6_run.log`；
+- 每组场景目录下的 `config.yaml`、`timing.json`、`poses/`、`logs/`、`eval/`（包括 `eval/in035/cam*_montage.png`）、`prepare/prepare.json`、`tokens/tokens.json`；
+- `gs/in035/*/meta.json`（含 TTO 耗时与监督框）；
+- 本机环境信息：GPU、驱动、torch、gsplat 版本。
+
+不用上传：`aligned/`、`flow/`、`gs/` 里的大图。
+
 ## 0. 六路新数据集上的局部 GS 验证（配置 `configs/dataset6_lean.yaml`，脚本 `scripts/run_scenes.py`）
 
 方法和第十二轮的精简流程完全相同：token 变体 rife，`_al` 对齐域，直接贴回并附 oracle 上限，前馈 + TTO 50 / 100 / 200 步，逐视图裁剪监督。只把数据换成六路阵列数据集（2304×1296 原图 `datasets/`，标定在 `datasets_1080/calib/`，灰墙背景）。
@@ -111,7 +199,7 @@ python scripts/validate_results.py configs/mofang_9cam_lean.yaml
 3. **最少步数**：cam3 和 cam5 最早在哪个检查点达到 6/6、3/4，以及对应的每帧耗时。
 4. **流程总耗时**：从 GS 到评估完，应在十几分钟内。
 
-## 0.a 新主机（例如 4090）准备
+## 0.a 新主机准备（魔方数据 / 第十二轮用；六路数据集见上面 ★ 一节）
 
 需要从旧主机或网上拿到下面这些（`data_root` 默认 `/home/han/linux-han`，也可以用环境变量 `LGS_DATA_ROOT` 指定）：
 
