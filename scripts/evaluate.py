@@ -4,7 +4,12 @@
 Re-run freely after changing the `risk` / `eval` sections of the config; nothing upstream needs to
 be recomputed. Methods whose render covers only part of the frame (ROI crops) are scored on the
 covered part of each region; the `coverage` column says how much that is.
-Outputs: work/eval/metrics.csv, auc.csv, registration.csv, risk_sweep.csv, summary.md,
+Round 8 (target-side check): token paste-back only where the reference flow's own failure signals at
+the actual t (|W0-W1|, collinearity residual) also flag the target view: hyb_tokchk_<name>[v] pastes on
+core & risk(target), GT-free, one method per eval.target_check entry; hyb_tokchk_oracle[v] = core & oracle
+failure region (GT, upper bound of a perfect target-side check). Only for local variants ending in
+eval.target_check_suffix. Per-target paste areas go to tokchk.csv.
+Outputs: work/eval/metrics.csv, auc.csv, registration.csv, risk_sweep.csv, tokchk.csv, summary.md,
          <setup>/cam{k}_montage.png
 """
 import argparse
@@ -156,7 +161,8 @@ def main():
     out_dir.mkdir(parents=True, exist_ok=True)
     lp = LPIPSRegion("cuda" if torch.cuda.is_available() else "cpu")
     rows, auc_rows, t_rows, gs_rows, reg_rows, sweep_rows, tuned = [], [], [], [], [], [], {}
-    paste_rows, token_rows = [], []
+    paste_rows, token_rows, chk_rows = [], [], []
+    checks = ecfg.get("target_check") or []
     ref = ecfg["ref_flow"]
 
     for setup in args.setups or list(cfg["setups"]):
@@ -238,6 +244,10 @@ def main():
             reg["object"] = dilate(cube, ecfg["object_dilate_px"]) & dilate(b["fg_gt"], 3) & valid
 
             preds = {fv: load_rgb(flow_dir / fv / f"cam{k}.png") for fv in flow_vars}
+            near_free = dilate(chroma_fg(preds[ref], ck), rcfg["fg_dilate_px"])  # GT-free subject neighbourhood
+            risk_t = {c["name"]: risk_from_signals(sig, near_free, c["warp"], c["col"],
+                                                   dict(rcfg, dilate_px=c.get("dilate_px", rcfg["dilate_px"])))
+                      for c in checks}
             cover = {m: np.ones(gt.shape[:2], bool) for m in preds}
             gs_ok = {}
             paste = {}
@@ -269,6 +279,15 @@ def main():
                     for m in (f"hyb_token[{gv}]", f"hyb_token_ringreg[{gv}]"):
                         cover[m] = np.ones(gt.shape[:2], bool)
                     token_rows.append([setup, k, gv, float(core.sum() / max(fg.sum(), 1)), rdisp])
+                    if checks and gv.endswith(ecfg.get("target_check_suffix", "_al_local")):
+                        sels = {n: core & r for n, r in risk_t.items()}
+                        sels["oracle"] = core & reg["oracle_fail"]
+                        for n, sel in sels.items():
+                            m = f"hyb_tokchk_{n}[{gv}]"
+                            preds[m] = blend_w(preds[ref], p, paste_weight(sel, ok, tcfg["paste_feather_px"]))
+                            cover[m] = np.ones(gt.shape[:2], bool)
+                            chk_rows.append([setup, k, gv, n, float(core.sum() / max(fg.sum(), 1)),
+                                             float(sel.sum() / max(fg.sum(), 1))])
                     continue  # local GS is only meant to be pasted back; skip GT registration/other hybrids
                 # Fit on the whole foreground except the scored object area, so the object gain is not fitted.
                 reg_mask = fg & (ok > 0) & ~reg["object"]
@@ -384,17 +403,58 @@ def main():
                                  "area_ratio"], sweep_rows)
     write_csv("paste.csv", ["setup", "target", "local_variant", "method", "psnr", "ssim", "lpips",
                             "paste_area_frac_fg"], paste_rows)
+    write_csv("tokchk.csv", ["setup", "target", "local_variant", "check", "core_frac_fg", "paste_frac_fg"],
+              chk_rows)
     write_csv("token_ringreg.csv", ["setup", "target", "local_variant", "paste_area_frac_fg", "ring_disp_px"],
               token_rows)
     tok_json = work / "tokens" / "tokens.json"
     token_report = load_json(tok_json) if tok_json.exists() else None
     write_summary(out_dir / "summary.md", rows, auc_rows, t_rows, gs_rows, reg_rows, sweep_rows, tuned, rcfg, ref,
-                  paste_rows, token_rows, token_report)
+                  paste_rows, token_rows, token_report, chk_rows)
     print(f"done -> {out_dir / 'summary.md'}")
 
 
+def target_check_table(rows, chk_rows, ref):
+    """Round 8: token paste-back restricted by the target-side flow risk, per token variant and check."""
+    fgm = {(r[0], int(r[1]), r[2]): (r[4], r[6]) for r in rows if r[3] == "fg"}
+    reg = {(r[0], int(r[1]), r[2], r[3]): r[4] for r in rows if r[3] in ("object", "rest")}
+    area = defaultdict(list)
+    for s, k, gv, n, cf, pf in chk_rows:
+        area[(s, gv, n)].append((int(k), pf, cf))
+    out = ["", "### 目标侧光流风险复核（第八轮：贴回区 = token core ∩ 目标视点光流风险区，不用真值；oracle = core ∩ 真值失败区）", "",
+           "不差 = 该目标 fg 的 PSNR 不低于且 LPIPS 不高于纯光流（门限关闭/贴回区为空时恰好等于光流）。", "",
+           "| 设置 | token 变体 | 复核 | 贴回区占前景 | fg PSNR / LPIPS | object PSNR | rest PSNR | 不差目标数 |",
+           "|---|---|---|---:|---:|---:|---:|---:|"]
+    for s in sorted({a[0] for a in area}):
+        ks = sorted({k for (ss, k, m) in fgm if ss == s and m == ref})
+        fp = np.mean([fgm[(s, k, ref)][0] for k in ks])
+        fl = np.mean([fgm[(s, k, ref)][1] for k in ks])
+        out.append(f"| {s} | 纯光流 | — | — | {fmt(fp)} / {fmt(fl, 4)} | "
+                   f"{fmt(np.mean([reg.get((s, k, ref, 'object'), np.nan) for k in ks]))} | "
+                   f"{fmt(np.mean([reg.get((s, k, ref, 'rest'), np.nan) for k in ks]))} | — |")
+        for gv in sorted({g for (ss, g, _) in area if ss == s}):
+            short = gv.replace("gs_tok", "").split("448")[0]
+            names = ["none"] + sorted({n for (ss, g, n) in area if ss == s and g == gv} - {"oracle"}) + ["oracle"]
+            for n in names:
+                m = f"hyb_token[{gv}]" if n == "none" else f"hyb_tokchk_{n}[{gv}]"
+                vals = [fgm.get((s, k, m)) for k in ks]
+                if any(v is None for v in vals):
+                    continue
+                ok = sum(v[0] >= fgm[(s, k, ref)][0] - 1e-6 and v[1] <= fgm[(s, k, ref)][1] + 1e-6
+                         for k, v in zip(ks, vals))
+                if n == "none":
+                    pa = np.mean([x[2] for x in area[(s, gv, names[1])]]) if len(names) > 2 else float("nan")
+                else:
+                    pa = np.mean([x[1] for x in area[(s, gv, n)]])
+                out.append(f"| {s} | {short} | {'不复核' if n == 'none' else n} | {fmt(pa * 100, 1)}% | "
+                           f"{fmt(np.mean([v[0] for v in vals]))} / {fmt(np.mean([v[1] for v in vals]), 4)} | "
+                           f"{fmt(np.mean([reg.get((s, k, m, 'object'), np.nan) for k in ks]))} | "
+                           f"{fmt(np.mean([reg.get((s, k, m, 'rest'), np.nan) for k in ks]))} | {ok}/{len(ks)} |")
+    return out
+
+
 def write_summary(path, rows, auc_rows, t_rows, gs_rows, reg_rows, sweep_rows, tuned, rcfg, ref,
-                  paste_rows=(), token_rows=(), token_report=None):
+                  paste_rows=(), token_rows=(), token_report=None, chk_rows=()):
     agg = defaultdict(list)
     area = defaultdict(list)
     for s, k, meth, r, p, ss, l, apx, afr, cov in rows:
@@ -499,6 +559,8 @@ def write_summary(path, rows, auc_rows, t_rows, gs_rows, reg_rows, sweep_rows, t
                     tag = f"core {fmt(pinfo.get('core', float('nan')) * 100, 1)}%{'*' if pinfo.get('gated') else ''}"
                     cells.append(f"{hv[0] - fp:+.2f} / {hv[1] - fl:+.4f} ({tag})" if hv else "—")
                 lines.append(f"| {s} | {k} | {a}-{b} | {fmt(fp)} / {fmt(fl, 4)} | " + " | ".join(cells) + " |")
+        if chk_rows:
+            lines += target_check_table(rows, chk_rows, ref)
         lines += ["", "## 其余诊断（整窗口 GS、用真值配准的上限等）", ""]
     def pose_src(m):
         core = m[:-len("_local")] if m.endswith("_local") else m

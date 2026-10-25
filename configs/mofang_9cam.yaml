@@ -91,3 +91,12 @@ eval:
   reg_min_px: 2000                      # GS 配准诊断所需的最少前景像素
   sweep_warp: [0.06, 0.08, 0.10, 0.12, 0.15, 0.20, 0.25, 0.30, 0.40]   # 风险阈值扫描（|W0-W1|）
   sweep_col: [2.0, 3.0, 4.0, 6.0, 1.0e+9]                 # 共线残差阈值，1e9 表示不用该信号
+  # 第八轮：目标侧光流风险复核。贴回区 = token core ∩ 参考光流在实际 t 下的风险区（|W0-W1| > warp 或共线残差 > col，
+  # 外扩 dilate_px，限制在光流结果抠像前景附近；不用真值）。每项生成 hyb_tokchk_<name>[v]，另附 oracle（core ∩ 真值失败区）作上限。
+  target_check_suffix: _al_local        # 只对可部署的 _al 局部变体做复核
+  target_check:
+    - {name: w06, warp: 0.06, col: 2.0,    dilate_px: 9}
+    - {name: w08, warp: 0.08, col: 2.0,    dilate_px: 9}    # = risk 段默认阈值
+    - {name: w12, warp: 0.12, col: 3.0,    dilate_px: 9}
+    - {name: w20, warp: 0.20, col: 6.0,    dilate_px: 9}    # = token 变体 rife 的阈值
+    - {name: w08d, warp: 0.08, col: 2.0,   dilate_px: 21}   # 风险区外扩更大：失败区常是一整块，|W0-W1| 只亮在边缘

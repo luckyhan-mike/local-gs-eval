@@ -14,7 +14,29 @@
 
 ---
 
-## 0. 第七轮：逐对 token + 固定编码窗口（当前主实验）
+## 0. 第八轮：目标侧光流风险复核（当前主实验，只改评估）
+
+第七轮结论：固定窗口后所有变体共用一次编码（自渲染 29.1 / 29.4 dB），cam5 strict 的崩溃消失。cam3 上不加门限的 `rife` 是目前最好的结果（fg 26.31 dB / 0.0536，光流 22.60 / 0.0629；rest 33.49）。但按面积设门限两头都判错了。下表是 rife 的贴回区内 PSNR，光流 → GS：
+
+| 目标 | 相机对 core | 贴回区内 光流 → GS | 门限 0.03 |
+|---|---:|---|---|
+| cam3 5 / 6 / 7（对 4–8） | 2.5% | 15.9→20.3 / 14.5→19.0 / 16.7→18.5 | 错关：头发与衬衫交界的遮挡带，光流确实错了 |
+| cam5 1（对 0–2） | 5.9% | 16.7→18.7 | 触发，正确 |
+| cam5 3（对 2–4） | 3.7% | 24.6→21.5 | 错开：光流本来就对 |
+| cam5 5（对 4–6） | 0.8% | 19.0→17.0 | 关闭，正确 |
+
+决定 GS 能不能赢的，是**这个虚拟视点里光流在贴回区错得有多严重**：GS 偏糊，在这些区域大约只能做到 18–21 dB；光流低于约 17 dB 时 GS 赢，高于约 19 dB 时 GS 输。输入相机上的 token 面积只说明这里可能有问题，回答不了这个问题。
+
+第八轮在贴回前加一步**目标侧复核**：贴回区 = token core ∩ 参考光流在实际 t 下自己的风险区。风险区由 |W₀−W₁| 或共线残差超阈值、外扩、限制在光流结果抠像前景附近得到，第二轮测得这两个信号的 AUC 约 0.9，全程不用真值。实现上只改 `evaluate.py`，不需要重跑 AnySplat：
+
+- `eval.target_check` 列出几组阈值（`w06` / `w08` / `w12` / `w20` / `w08d`），每组生成 `hyb_tokchk_<name>[v]`；
+- 另加 `hyb_tokchk_oracle[v]` = core ∩ 真值失败区，作为"完美目标侧复核"的上限（诊断用）；
+- 只对 `_al_local` 变体做（`target_check_suffix`）；每个目标的贴回面积写在 `tokchk.csv`；
+- `summary.md` 新增"目标侧光流风险复核"表：每个 token 变体 × 复核方式的贴回面积、fg / object / rest，以及"不差目标数"（fg 的 PSNR 不低于、LPIPS 不高于纯光流的目标个数）。
+
+判断标准：理想的复核方式在 cam3 保留不加门限 `rife` 的大部分收益（fg ≈ 26 dB），6/6 个目标不差；在 cam5 让目标 3、5 退回光流，fg 不低于 28.00 / 0.0396。再与 oracle 行比较，看目标侧信号离完美复核还差多少。
+
+## 0.0 第七轮：逐对 token + 固定编码窗口
 
 第六轮结论：收紧 token 后 cam3 的 `strict`/`rife` 第一次在 fg 的 PSNR、LPIPS 两项上都优于纯光流（strict 26.31 dB / 0.0558 vs 22.60 / 0.0629）。但逐目标拆开看，**收益全部来自目标 1–3**：
 
@@ -44,7 +66,7 @@
 
 预期：cam3 目标 1–3 保持第六轮的提升，目标 5–7 回到纯光流附近（`*_g` 恰好等于纯光流），6 个目标都不差于光流；cam5 大部分目标等于纯光流，fg 不再低于光流。
 
-## 0.0 第六轮：收紧 token 检测
+## 0.01 第六轮：收紧 token 检测
 
 第五轮结论：对齐域渲染解决了几何错位（cam3 环带位移 0 px），token 贴回第一次超过纯光流（cam3 fg 25.27 vs 22.60 dB，魔方区 16.99 vs 14.53 dB）。但贴回区仍覆盖约 49% 前景，而光流真正失败的区域只有约 12%；其余部分把正确的光流换成更软的 GS，导致 fg LPIPS 和 rest 变差。用同一批 `_al` 高斯只贴 oracle 失败区时 fg 达到 27.03 dB / 0.057（PSNR 与 LPIPS 均优于光流），说明**瓶颈是检测精度**。小基线（cam5）即使完美检测也不如光流，应基本不触发。
 
@@ -205,6 +227,18 @@ cd local-gs-eval && git pull
 HF_HUB_OFFLINE=1 PYTHONUNBUFFERED=1 bash run_all.sh configs/mofang_9cam.yaml
 python -m unittest discover -s tests -v
 ```
+
+**第八轮（复用第七轮的 token 和 GS，只重跑评估）**：
+
+```bash
+export LGS_WORK_DIR=work/round8
+mkdir -p $LGS_WORK_DIR && cp -r work/round7/{prepare,flow,poses,tokens,gs,compat_packages} $LGS_WORK_DIR/
+python scripts/evaluate.py      --config configs/mofang_9cam.yaml
+python scripts/validate_results.py configs/mofang_9cam.yaml
+python -m unittest discover -s tests -v
+```
+
+`gs/` 较大时也可以用软链接代替复制（`ln -s $(pwd)/work/round7/gs $LGS_WORK_DIR/gs`）。先看 `summary.md` 的"目标侧光流风险复核"表，再看 `tokchk.csv` 的逐目标贴回面积。
 
 **第七轮（复用第六轮的工作目录）**：`prepare`、光流、`poses/` 不变；token 需要重新检测（新增逐对目录），GS 只编码一次：
 
