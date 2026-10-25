@@ -207,6 +207,96 @@ class NumericsTests(unittest.TestCase):
         np.testing.assert_array_equal(kc[1], [False, False, False])  # target 6: pair 4-8 has no tokens
         self.assertEqual(counts["4-8"]["core"], 0)
 
+    def test_reproject_textured_plane_and_occlusion(self):
+        from lgs.aligned import ray_plane
+        from lgs.reproject import grid_points, reproject_view, zbuffer_depth
+        n, d = np.array([0, 0, 1.0]), 10.0
+
+        def tex(X):  # smooth texture on the plane
+            return np.stack([0.5 + 0.4 * np.sin(X[:, 0] * 1.3), 0.5 + 0.4 * np.cos(X[:, 1] * 0.9),
+                             0.5 + 0.2 * np.sin(X[:, 0] + X[:, 1])], -1)
+
+        K = np.array([[100.0, 0, 79.5], [0, 100.0, 59.5], [0, 0, 1]])
+        cams = {}
+        for name, cx in (("a", -1.0), ("b", 1.0), ("v", 0.0)):
+            c2w = np.eye(4)
+            c2w[0, 3] = cx
+            cams[name] = c2w
+        xs, ys = np.meshgrid(np.arange(160.0), np.arange(120.0))
+        px = np.c_[xs.reshape(-1), ys.reshape(-1)]
+        imgs = {k: tex(ray_plane(K, cams[k], px, n, d)).reshape(120, 160, 3).astype(np.float32) for k in "ab"}
+        win, size = (20, 0, 120), 60  # square crop of the raw image, input grid 60 x 60
+        Kc = np.array([[50.0, 0, (79.5 - 20) / 2], [0, 50.0, 59.5 / 2], [0, 0, 1]])
+        dep = np.full((size, size), d)
+        pts = np.concatenate([grid_points(Kc, cams[k], dep)[0] for k in "ab"])
+        depth, valid = zbuffer_depth(pts, K, cams["v"], 160, 120, scale=0.5)
+        self.assertGreater(valid[20:100, 40:120].mean(), 0.99)
+        src = [dict(img=imgs[k], K=K, c2w=cams[k], depth=dep, window=win, weight=0.5) for k in "ab"]
+        rgb, alpha, nvis = reproject_view(K, cams["v"], depth, valid, src, 0.05)
+        exp = tex(ray_plane(K, cams["v"], px, n, d)).reshape(120, 160, 3)
+        m = (alpha > 0) & valid
+        m[:, :30] = m[:, 130:] = False
+        self.assertGreater(m[20:100, 40:120].mean(), 0.99)
+        self.assertLess(np.abs(rgb - exp)[m].mean(), 0.01)
+        # an occluder in front of camera a's view of the point: only camera b is used there
+        dep_a = dep.copy()
+        dep_a[:, 25:35] = 5.0
+        src[0]["depth"] = dep_a
+        _, _, nvis2 = reproject_view(K, cams["v"], depth, valid, src, 0.05)
+        self.assertTrue(((nvis2 == 1) & m).any())
+        self.assertLess(((nvis2 == 1) & m).sum(), m.sum())
+
+    def test_reproject_targets_matches_real_camera_on_plane(self):
+        import cv2
+        from lgs.aligned import crop_K_to_raw, ray_plane
+        from scripts.run_anysplat import aligned_setup, reproject_targets
+        cams, hs, n, d = self._aligned_scene()
+        win, size = (420, 0, 1080), 96
+
+        def tex(X):
+            return np.stack([0.5 + 0.4 * np.sin(X[:, 0] * 0.9), 0.5 + 0.4 * np.cos(X[:, 1] * 0.7),
+                             0.5 + 0.2 * np.sin(0.5 * (X[:, 0] - X[:, 1]))], -1)
+
+        xs, ys = np.meshgrid(np.arange(1920.0), np.arange(1080.0))
+        px = np.c_[xs.reshape(-1), ys.reshape(-1)]
+        raws = {k: (np.clip(tex(ray_plane(cams[k][0], cams[k][1], px, n, d)), 0, 1).reshape(1080, 1920, 3) * 255
+                    ).astype(np.uint8) for k in (0, 4, 2)}
+
+        def crop_norm(K):
+            x0, y0, side = win
+            return np.array([[K[0, 0] / side, 0, (K[0, 2] - x0) / side], [0, K[1, 1] / side, (K[1, 2] - y0) / side],
+                             [0, 0, 1]])
+
+        ctx = [0, 4, 8]
+        state = {"ctx_c2w": np.stack([cams[c][1] for c in ctx]), "ctx_intr": np.stack([crop_norm(cams[c][0]) for c in ctx]),
+                 "size": size, "tgt_c2w": np.stack([cams[2][1]])}
+        g = np.arange(size, dtype=np.float64)
+        gx, gy = np.meshgrid(g, g)
+        vd = []
+        for c in ctx:  # plane depth on each input camera's crop grid (what VGGT would predict)
+            Kr = crop_K_to_raw(state["ctx_intr"][ctx.index(c)], win)
+            gp = np.c_[gx.reshape(-1) * win[2] / size + win[0], gy.reshape(-1) * win[2] / size + win[1]]
+            X = ray_plane(Kr, cams[c][1], gp, n, d)
+            vd.append(((X - cams[c][1][:3, 3]) @ cams[c][1][:3, :3])[:, 2].reshape(size, size))
+        state["vggt_depth"] = np.stack(vd)
+
+        class MockRunner:
+            def render_px(self, state, c2w, K, w, h, keep=None, depth=False, **kw):
+                return np.zeros((1, h, w, 3), np.float32), np.ones((1, h, w), np.float32), np.full((1, h, w), 29.0)
+
+        al = aligned_setup(MockRunner(), state, ctx, [2], win, hs, {"aligned_ref": 4, "aligned_pad_px": 160},
+                           {2: 0.5}, (1080, 1920))
+        views, stats = reproject_targets(MockRunner(), state, al, "aligned_vggt", ctx, [2], {2: 0.5}, raws, win,
+                                         "vggt", {"vis_tol": 0.05}, None)
+        img, alpha, valid = views[0]
+        exp = cv2.warpPerspective(raws[2].astype(np.float32) / 255, hs[2], (1920, 1080), flags=cv2.INTER_LINEAR)
+        m = (alpha > 0.99) & valid
+        m[:, :700] = m[:, 1300:] = False  # central part, away from the crop window's edges
+        m[:150] = m[950:] = False
+        self.assertGreater(m.sum(), 100000)
+        self.assertLess(np.abs(img - exp)[m].mean(), 0.02)
+        self.assertGreater(stats[0]["seen_by_both"], 0.3)
+
     def test_target_poses_calib_identity_frame(self):
         from scripts.run_anysplat import target_poses
         c2w = np.repeat(np.eye(4)[None], 4, 0)

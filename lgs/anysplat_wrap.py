@@ -138,6 +138,11 @@ class AnySplatRunner:
             "tgt_c2w": aligned[nc:], "tgt_intr": all_intr[nc:],
             "all_c2w_joint": all_c2w,
         }
+        # VGGT depth maps of the context views (AnySplat's depth head, same frame as the Gaussians)
+        dd = getattr(enc_out, "depth_dict", None) or {}
+        if dd.get("depth") is not None:
+            d = dd["depth"][0].float().cpu().numpy()
+            state["vggt_depth"] = d[..., 0] if d.ndim == 4 else d
         diag = {
             "num_gaussians": int(g.means.shape[1]),
             "time_encode_s": t_enc,

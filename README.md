@@ -14,7 +14,38 @@
 
 ---
 
-## 0. 第八轮：目标侧光流风险复核（当前主实验，只改评估）
+## 0. 第九轮：几何来自 3D，纹理取自输入图（当前主实验）
+
+第八轮结论：目标侧复核几乎没有改变贴回区。光流自己的风险信号在魔方边缘总会亮，不管合成得对不对，和 token 检测本质上是同一信息。更关键的是，**完美检测也只多出很少的收益**：
+
+| | cam3 fg | cam5 fg |
+|---|---|---|
+| 纯光流 | 22.60 / 0.0629 | **28.00 / 0.0396** |
+| rife 直接贴回 | 26.31 / 0.0536 | 27.71 / 0.0420 |
+| rife，只贴真值失败区（oracle） | 26.51 / 0.0513 | 27.96 / 0.0406 |
+
+cam3 上检测已接近饱和（只差 0.2 dB）。cam5 上即使只在光流真正出错的像素贴 GS，也仍然不如光流（目标 3 为 −0.95 dB）。瓶颈因此在 **GS 补丁本身的颜色**：AnySplat 前馈出的纹理偏软，贴回区内只有约 18–21 dB；而它的几何是可靠的（环带位移约 0，plane RMS 约 2 px）。
+
+第九轮把几何和纹理拆开：3D 模型只提供虚拟视点的深度；颜色按深度反投影后，从两侧输入**原图**（全分辨率、清晰）采样。只取输入相机真正看得到的点（深度测试），两侧按 (1−t, t) 加权（`lgs/reproject.py`）。几何来源对比两条路线，其余流程完全相同：
+
+| 后缀 | 虚拟视点深度 | 输入相机可见性 |
+|---|---|---|
+| `_rpgs` | 在虚拟视点渲染全部高斯的期望深度 | 高斯在各输入相机渲染的深度 |
+| `_rpvggt` | AnySplat 内部 VGGT 深度图（两侧输入视点）前向投影到虚拟视点，z-buffer 取最近，空洞按较远邻居（背景）填补 | 同一 VGGT 深度图 |
+
+- 两条路线用**同一个 token 贴回区**（`alpha_core` 与对应 GS 局部变体相同），只换颜色来源，所以和"GS 颜色贴回"是严格对照。
+- VGGT 深度直接取自 AnySplat 编码时的深度头输出（`depth_dict`），与高斯在同一坐标系，不需要另跑模型。日志和 `meta.json` 中的 `vggt_vs_gs_depth_rel` 给出两者在输入视点上的深度差（中位相对误差）；`reproject_stats` 给出虚拟视点每个像素被两侧/一侧/零侧输入相机看到的比例。
+- 只对可部署的 `aligned_int` 位姿做（`gs.reproject.sources`）。输出目录：`gs_tok<变体>448_nat_dil_al_rpgs_local`、`…_al_rpvggt_local`，评估自动生成 `hyb_token[…]` 和 `hyb_tokchk_oracle[…]`。
+- 目标侧复核只保留 `w20` 和 oracle（第八轮其余阈值与不复核几乎相同）。
+- `summary.md` 新增"纹理取自输入图"表：每个 token 变体 × 三种颜色来源（GS 颜色 / GS 几何 + 输入纹理 / VGGT 几何 + 输入纹理）× 直接贴回 / oracle，列出 fg、object、rest 和不差目标数。
+
+判断标准：
+1. 输入纹理是否比 GS 颜色更好：同一 token 下 `_rpgs` / `_rpvggt` 的 fg LPIPS 应明显低于 GS 颜色，cam3 的 PSNR 不低于 26.3。
+2. cam5 是否终于超过光流：至少 oracle 行应优于光流 28.00 / 0.0396；直接贴回最好也不低于光流。
+3. VGGT 能否替代 GS：`_rpvggt` 不差于 `_rpgs`，说明可以去掉 GS，框架简化为"光流主干 + VGGT 几何引导局部重投影"。
+4. 风险点：深度边缘（魔方与头发交界）。448 分辨率深度在原图上会偏软，可能出现颜色渗出或飞点，注意看拼图和 object 区 LPIPS。
+
+## 0.00 第八轮：目标侧光流风险复核（只改评估）
 
 第七轮结论：固定窗口后所有变体共用一次编码（自渲染 29.1 / 29.4 dB），cam5 strict 的崩溃消失。cam3 上不加门限的 `rife` 是目前最好的结果（fg 26.31 dB / 0.0536，光流 22.60 / 0.0629；rest 33.49）。但按面积设门限两头都判错了。下表是 rife 的贴回区内 PSNR，光流 → GS：
 
@@ -227,6 +258,19 @@ cd local-gs-eval && git pull
 HF_HUB_OFFLINE=1 PYTHONUNBUFFERED=1 bash run_all.sh configs/mofang_9cam.yaml
 python -m unittest discover -s tests -v
 ```
+
+**第九轮（复用第七轮的 token；GS 需要重跑，因为要输出深度和重投影结果）**：
+
+```bash
+export LGS_WORK_DIR=work/round9
+mkdir -p $LGS_WORK_DIR && cp -r work/round7/{prepare,flow,poses,tokens,compat_packages} $LGS_WORK_DIR/
+python scripts/run_anysplat.py  --config configs/mofang_9cam.yaml
+python scripts/evaluate.py      --config configs/mofang_9cam.yaml
+python scripts/validate_results.py configs/mofang_9cam.yaml
+python -m unittest discover -s tests -v
+```
+
+日志里每个设置会打印 `VGGT vs GS depth on inputs`（两种几何在输入视点上的差异）和 `reproject[aligned_int/gs|vggt]: camK both=… none=…`（虚拟视点像素被两侧输入都看到/都看不到的比例）。重投影在 CPU 上用 numpy 计算，每个目标视点约数秒。先看 `summary.md` 的"纹理取自输入图"表。
 
 **第八轮（复用第七轮的 token 和 GS，只重跑评估）**：
 

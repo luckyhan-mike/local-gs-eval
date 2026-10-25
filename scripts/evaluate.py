@@ -162,7 +162,7 @@ def main():
     lp = LPIPSRegion("cuda" if torch.cuda.is_available() else "cpu")
     rows, auc_rows, t_rows, gs_rows, reg_rows, sweep_rows, tuned = [], [], [], [], [], [], {}
     paste_rows, token_rows, chk_rows = [], [], []
-    checks = ecfg.get("target_check") or []
+    checks = ecfg.get("target_check")  # None: no target-side check; []: oracle only
     ref = ecfg["ref_flow"]
 
     for setup in args.setups or list(cfg["setups"]):
@@ -247,7 +247,7 @@ def main():
             near_free = dilate(chroma_fg(preds[ref], ck), rcfg["fg_dilate_px"])  # GT-free subject neighbourhood
             risk_t = {c["name"]: risk_from_signals(sig, near_free, c["warp"], c["col"],
                                                    dict(rcfg, dilate_px=c.get("dilate_px", rcfg["dilate_px"])))
-                      for c in checks}
+                      for c in checks or []}
             cover = {m: np.ones(gt.shape[:2], bool) for m in preds}
             gs_ok = {}
             paste = {}
@@ -279,7 +279,8 @@ def main():
                     for m in (f"hyb_token[{gv}]", f"hyb_token_ringreg[{gv}]"):
                         cover[m] = np.ones(gt.shape[:2], bool)
                     token_rows.append([setup, k, gv, float(core.sum() / max(fg.sum(), 1)), rdisp])
-                    if checks and gv.endswith(ecfg.get("target_check_suffix", "_al_local")):
+                    suf = ecfg.get("target_check_suffix", "_al_local")
+                    if checks is not None and gv.endswith(tuple(suf) if isinstance(suf, list) else suf):
                         sels = {n: core & r for n, r in risk_t.items()}
                         sels["oracle"] = core & reg["oracle_fail"]
                         for n, sel in sels.items():
@@ -412,6 +413,48 @@ def main():
     write_summary(out_dir / "summary.md", rows, auc_rows, t_rows, gs_rows, reg_rows, sweep_rows, tuned, rcfg, ref,
                   paste_rows, token_rows, token_report, chk_rows)
     print(f"done -> {out_dir / 'summary.md'}")
+
+
+def reproject_table(rows, ref):
+    """Round 9: same token core, three colour sources (GS colours / input texture with GS depth / input
+    texture with VGGT depth), pasted directly and on the oracle part of the core."""
+    fgm = {(r[0], int(r[1]), r[2]): (r[4], r[6]) for r in rows if r[3] == "fg"}
+    reg = {(r[0], int(r[1]), r[2], r[3]): (r[4], r[6]) for r in rows if r[3] in ("object", "rest")}
+    methods = {m for (_, _, m) in fgm}
+    rp = sorted({re.sub(r"_rp\w+?_local\]$", "_local]", m) for m in methods
+                 if m.startswith("hyb_token[") and re.search(r"_rp\w+?_local\]$", m)})
+    if not rp:
+        return []
+    kinds = [("", "GS 颜色"), ("_rpgs", "GS 几何 + 输入纹理"), ("_rpvggt", "VGGT 几何 + 输入纹理")]
+    out = ["", "### 纹理取自输入图（第九轮：同一 token 贴回区，颜色来源不同；oracle = 只贴 core ∩ 真值失败区）", "",
+           "| 设置 | token 变体 | 颜色来源 | 贴回 | fg PSNR / LPIPS | object PSNR / LPIPS | rest PSNR | 不差目标数 |",
+           "|---|---|---|---|---:|---:|---:|---:|"]
+    for s in sorted({r[0] for r in rows}):
+        ks = sorted({k for (ss, k, m) in fgm if ss == s and m == ref})
+
+        def line(name, kind, how, m):
+            vals = [fgm.get((s, k, m)) for k in ks]
+            if not ks or any(v is None for v in vals):
+                return None
+            ok = sum(v[0] >= fgm[(s, k, ref)][0] - 1e-6 and v[1] <= fgm[(s, k, ref)][1] + 1e-6
+                     for k, v in zip(ks, vals))
+            ob = [reg.get((s, k, m, "object"), (np.nan, np.nan)) for k in ks]
+            return (f"| {s} | {name} | {kind} | {how} | {fmt(np.mean([v[0] for v in vals]))} / "
+                    f"{fmt(np.mean([v[1] for v in vals]), 4)} | {fmt(np.mean([o[0] for o in ob]))} / "
+                    f"{fmt(np.mean([o[1] for o in ob]), 4)} | "
+                    f"{fmt(np.mean([reg.get((s, k, m, 'rest'), (np.nan,))[0] for k in ks]))} | "
+                    f"{'—' if m == ref else f'{ok}/{len(ks)}'} |")
+        out.append(line("—", "纯光流", "—", ref))
+        for hm in rp:
+            gv = hm[len("hyb_token["):-1]
+            name = gv.replace("gs_tok", "").split("448")[0]
+            for suf, kind in kinds:
+                g = gv[:-len("_local")] + suf + "_local"
+                for how, m in (("直接", f"hyb_token[{g}]"), ("oracle", f"hyb_tokchk_oracle[{g}]")):
+                    ln = line(name, kind, how, m)
+                    if ln:
+                        out.append(ln)
+    return [x for x in out if x]
 
 
 def target_check_table(rows, chk_rows, ref):
@@ -561,6 +604,7 @@ def write_summary(path, rows, auc_rows, t_rows, gs_rows, reg_rows, sweep_rows, t
                 lines.append(f"| {s} | {k} | {a}-{b} | {fmt(fp)} / {fmt(fl, 4)} | " + " | ".join(cells) + " |")
         if chk_rows:
             lines += target_check_table(rows, chk_rows, ref)
+        lines += reproject_table(rows, ref)
         lines += ["", "## 其余诊断（整窗口 GS、用真值配准的上限等）", ""]
     def pose_src(m):
         core = m[:-len("_local")] if m.endswith("_local") else m

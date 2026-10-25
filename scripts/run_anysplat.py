@@ -15,6 +15,11 @@ select different subsets (gs_tok<size>_* = full render, gs_tok<variant><size>_*_
 local render). The local Gaussians of a target between context cameras a and b come from the tokens
 detected in pair (a, b) only. gs.token_window: per_variant restores the round-6 behaviour (one encode
 per variant with its own window).
+
+Round 9 (gs.reproject): for aligned sources, the virtual view's depth comes from a 3D model and its
+colours from the two neighbouring input images (lgs/reproject.py); geometry gs = rendered Gaussian
+depth, vggt = AnySplat's VGGT depth maps forward-splatted. Written next to each token variant's local
+render as gs_tok<variant><size>_<render>_al_rp<geometry>_local (same token core, different colours).
 """
 import argparse
 import sys
@@ -31,6 +36,7 @@ from lgs.common import (bbox, cam_path, cube_mask, imread_rgb, imwrite, load_cfg
                         save_json, setup_cams, neighbors, write_mask)
 from lgs.aligned import aligned_reference, crop_K_to_raw, fit_plane, plane_homography  # noqa: E402
 from lgs.compat import anysplat_source  # noqa: E402
+from lgs.reproject import grid_points, reproject_view, zbuffer_depth  # noqa: E402
 
 
 def square_around(box, raw_shape, pad, min_side):
@@ -180,6 +186,75 @@ def render_aligned(runner, state, al, src, keep, kw):
                                     flags=cv2.INTER_NEAREST) > 0
         out.append((np.clip(img, 0, 1), a, valid))
     return out
+
+
+def reproject_targets(runner, state, al, src, ctx, targets, shared_t, raws, win, geom, rcfg, gs_ctx_depth):
+    """Round 9: per target, (rgb, alpha, valid) in the aligned domain with colours taken from the two
+    neighbouring input images and depth from `geom` (gs | vggt); plus diagnostics."""
+    h, w = al["shape"]
+    p = al["pad"]
+    W, H = w + 2 * p, h + 2 * p
+    K = al["K_al"].copy()
+    K[0, 2] += p
+    K[1, 2] += p
+    shift = np.array([[1, 0, -p], [0, 1, -p], [0, 0, 1.0]])
+    size = state["size"]
+    x0, y0, side = win
+    if geom == "vggt":
+        if "vggt_depth" not in state:
+            raise RuntimeError("AnySplat 编码输出里没有 VGGT 深度（depth_dict），无法做 vggt 几何重投影")
+        src_depth = state["vggt_depth"]
+    else:
+        src_depth = gs_ctx_depth
+    imgs = {}  # float raw images of the context cameras actually used
+    out, stats = [], []
+    for i, (k, c) in enumerate(zip(targets, al["centers"][src])):
+        a, b = neighbors(ctx, k)
+        t = float(shared_t[k])
+        cam = al["c2w_al"].copy()
+        cam[:3, 3] = c
+        if geom == "gs":
+            _, alpha, dep = runner.render_px(state, cam[None], K[None], W, H, depth=True)
+            depth, dvalid = dep[0], alpha[0] > 0.5
+        else:
+            pts = []
+            for kk in (a, b):
+                j = ctx.index(kk)
+                Kc = np.array(state["ctx_intr"][j], np.float64).copy()
+                Kc[:2] *= size
+                X, ok = grid_points(Kc, state["ctx_c2w"][j], src_depth[j])
+                pts.append(X[ok])
+            depth, dvalid = zbuffer_depth(np.concatenate(pts), K, cam, W, H,
+                                          scale=float(rcfg.get("splat_scale") or min(1.0, size / side)))
+        for kk in (a, b):
+            if kk not in imgs:
+                imgs[kk] = raws[kk].astype(np.float32) / 255.0
+        sources = [dict(img=imgs[kk], K=crop_K_to_raw(state["ctx_intr"][ctx.index(kk)], win),
+                        c2w=state["ctx_c2w"][ctx.index(kk)], depth=src_depth[ctx.index(kk)], window=win, weight=wt)
+                   for kk, wt in ((a, 1 - t), (b, t))]
+        rgb, ralpha, nvis = reproject_view(K, cam, depth, dvalid, sources, rcfg.get("vis_tol", 0.05))
+        G = plane_homography(al["K_al"], al["c2w_al"], c, al["n"], al["d"], (w, h)) @ shift
+        img = cv2.warpPerspective(rgb, G, (w, h), flags=cv2.INTER_LINEAR)
+        av = cv2.warpPerspective(ralpha, G, (w, h), flags=cv2.INTER_LINEAR)
+        valid = cv2.warpPerspective(np.ones((H, W), np.uint8), G, (w, h), flags=cv2.INTER_NEAREST) > 0
+        out.append((np.clip(img, 0, 1), av, valid))
+        nd = max(int(dvalid.sum()), 1)
+        stats.append({"target": k, "depth_valid_px": int(dvalid.sum()),
+                      "seen_by_both": float(((nvis == 2) & dvalid).sum() / nd),
+                      "seen_by_one": float(((nvis == 1) & dvalid).sum() / nd),
+                      "seen_by_none": float(((nvis == 0) & dvalid).sum() / nd)})
+    return out, stats
+
+
+def depth_agreement(state, gs_ctx_depth, size):
+    """Median relative difference between VGGT depth and rendered Gaussian depth on the input views."""
+    if "vggt_depth" not in state:
+        return None
+    res = []
+    for g, v in zip(gs_ctx_depth, state["vggt_depth"]):
+        m = (g > 0) & (v > 0)
+        res.append(float(np.median(np.abs(v[m] / g[m] - 1))) if m.any() else float("nan"))
+    return res
 
 
 def load_token_sets(tok_root, ctx, tcfg):
@@ -343,6 +418,11 @@ def main():
 
                 keeps, local_counts = {}, {}
                 depth = runner.ctx_depth(state) if locals_ else None
+                rcfg = gcfg.get("reproject") or {}
+                rp_cache = {}
+                if rcfg.get("geometries") and locals_:
+                    diag["vggt_vs_gs_depth_rel"] = depth_agreement(state, depth, size)
+                    print(f"  VGGT vs GS depth on inputs (median |ratio-1|): {diag['vggt_vs_gs_depth_rel']}")
                 for lab, (tv, ts) in locals_.items():
                     kr, kc, counts = local_keep(runner, state, ts, win, size, ctx, targets, gcfg, depth)
                     keeps[lab] = (tv, kr, kc)
@@ -423,6 +503,29 @@ def main():
                             save_json(out / "meta.json", meta)
                             print(f"  {variant}: res={res or 'aligned'} mode={rv['mode']} eps2d={eps2d:.3f} "
                                   f"filter3d={rv['filter3d']} render/view={t_render * 1000:.1f}ms")
+                            # Round 9: same token core, colours from the input images, depth from gs / vggt
+                            if kp is None or cores is None or src not in rcfg.get("sources", ["aligned_int"]):
+                                continue
+                            for geom in rcfg.get("geometries") or []:
+                                if (src, geom) not in rp_cache:
+                                    t1 = time.time()
+                                    rp_cache[(src, geom)] = reproject_targets(
+                                        runner, state, al, src, ctx, targets, shared_t, raws, win, geom, rcfg, depth)
+                                    rp_cache[(src, geom)] += ((time.time() - t1) / len(targets),)
+                                    st = rp_cache[(src, geom)][1]
+                                    print(f"  reproject[{src}/{geom}]: "
+                                          + ", ".join(f"cam{x['target']} both={x['seen_by_both']:.2f} "
+                                                      f"none={x['seen_by_none']:.2f}" for x in st))
+                                views_rp, st, t_rp = rp_cache[(src, geom)]
+                                out_rp = work / "gs" / setup / variant.replace("_local", f"_rp{geom}_local")
+                                for i, k in enumerate(targets):
+                                    img, a, valid = views_rp[i]
+                                    imwrite(out_rp / f"cam{k}.png", img)
+                                    imwrite(out_rp / f"cam{k}_alpha.png", np.clip(a, 0, 1))
+                                    write_mask(out_rp / f"cam{k}_valid.png", valid)
+                                    imwrite(out_rp / f"cam{k}_alpha_core.png", np.clip(cores[i][1], 0, 1))
+                                save_json(out_rp / "meta.json", dict(meta, reproject=geom, reproject_stats=st,
+                                                                     time_render_per_view_s=t_rp))
                 del state
 
 

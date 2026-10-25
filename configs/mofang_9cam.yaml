@@ -70,6 +70,11 @@ gs:
   aligned_ref: 4                        # 对齐参考相机（单应 H 近似相似变换的那台，即中心相机）
   aligned_pad_px: 160                   # 对齐域渲染画布四周的余量（平面单应会平移画面）
   token_window: fixed                   # fixed：所有 token 变体共用一次编码（窗口 = 各变体重建区并集），变体只决定选哪些高斯；per_variant：第六轮做法（每个变体按自己的窗口各编码一次，窗口小时 GS 变差）
+  reproject:                            # 第九轮：几何来自 3D、纹理取自输入原图（lgs/reproject.py），与 GS 颜色贴回用同一 token 贴回区
+    geometries: [gs, vggt]              # gs：渲染全部高斯的深度；vggt：AnySplat 内部 VGGT 深度图前向投影（z-buffer）
+    sources: [aligned_int]              # 只做可部署的对齐域、光心按 t 插值
+    vis_tol: 0.05                       # 输入相机可见性：点深度 ≤ 该相机深度图 ×(1+vis_tol)
+    splat_scale: null                   # vggt 点前向投影的分辨率比例；null = 448/窗口边长（点密度约每像素 1 个）
   keep_mode: visible                    # 局部高斯：visible=输入相机中深度测试后的可见表面；ray=视线穿过即保留（第四轮，足迹过大）
   visible_tol: 0.03                     # 可见性深度容差（相对）
   renders:                              # 每个 (crop, size) 只编码一次；第二、三轮滤波核差异 <0.1 dB，只保留 nat_dil
@@ -93,10 +98,7 @@ eval:
   sweep_col: [2.0, 3.0, 4.0, 6.0, 1.0e+9]                 # 共线残差阈值，1e9 表示不用该信号
   # 第八轮：目标侧光流风险复核。贴回区 = token core ∩ 参考光流在实际 t 下的风险区（|W0-W1| > warp 或共线残差 > col，
   # 外扩 dilate_px，限制在光流结果抠像前景附近；不用真值）。每项生成 hyb_tokchk_<name>[v]，另附 oracle（core ∩ 真值失败区）作上限。
-  target_check_suffix: _al_local        # 只对可部署的 _al 局部变体做复核
+  # 第八轮结论：w06~w20 与不复核几乎相同（光流风险区本来就覆盖 token core），本轮只保留 w20 与 oracle。
+  target_check_suffix: [_al_local, _al_rpgs_local, _al_rpvggt_local]   # GS 颜色与两种输入纹理都做（含 oracle）
   target_check:
-    - {name: w06, warp: 0.06, col: 2.0,    dilate_px: 9}
-    - {name: w08, warp: 0.08, col: 2.0,    dilate_px: 9}    # = risk 段默认阈值
-    - {name: w12, warp: 0.12, col: 3.0,    dilate_px: 9}
     - {name: w20, warp: 0.20, col: 6.0,    dilate_px: 9}    # = token 变体 rife 的阈值
-    - {name: w08d, warp: 0.08, col: 2.0,   dilate_px: 21}   # 风险区外扩更大：失败区常是一整块，|W0-W1| 只亮在边缘
