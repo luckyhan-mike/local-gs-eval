@@ -24,6 +24,8 @@ render as gs_tok<variant><size>_<render>_al_rp<geometry>_local (same token core,
 Round 10 (gs.tto): the Gaussians of the token reconstruction region are refined on the input views at
 full crop resolution (lgs/tto.py); each checkpoint is rendered like the feed-forward Gaussians, with
 suffix _tto<iterations> before _local (e.g. gs_tokrife448_nat_dil_al_tto300_local).
+Round 11 (gs.tto.crop): supervision only inside a box around the trainable Gaussians, early checkpoints,
+wall time per checkpoint in meta.json (tto.log[*].time_s).
 """
 import argparse
 import sys
@@ -464,9 +466,13 @@ def main():
                                                eps2d=0.3 * (R / size) ** 2)
                     diag["tto"] = {"train_gaussians": int(train.sum()), "res": R, "time_s": time.time() - t1,
                                    "log": olog}
+                    box = olog[0].get("box")
                     print(f"  TTO: {int(train.sum())} of {diag['num_gaussians']} Gaussians at {R}px, "
-                          f"{time.time() - t1:.1f}s; ctx PSNR " + ", ".join(
-                              f"it{e['iter']}={np.mean(e['ctx_psnr']):.2f}" for e in olog
+                          + (f"supervised box {box['w']}x{box['h']} ({box['area_frac'] * 100:.0f}% of view), "
+                             if box else "full view, ")
+                          + f"{time.time() - t1:.1f}s total; " + ", ".join(
+                              f"it{e['iter']}: PSNR {np.mean(e['ctx_psnr']):.2f}"
+                              + (f" @ {e['time_s']:.2f}s" if "time_s" in e else "") for e in olog
                               if e["iter"] == 1 or e["iter"] in snaps))
                     stages += [(f"_tto{it}", dict(state, gaussians=g_), it) for it, g_ in sorted(snaps.items())]
 

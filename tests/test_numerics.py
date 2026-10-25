@@ -333,6 +333,36 @@ class NumericsTests(unittest.TestCase):
         torch.testing.assert_close(h60[3:], h0[3:])          # frozen Gaussians untouched
         self.assertGreater(float((h60[:3] - h0[:3]).abs().max()), 1e-3)
 
+        # round 11: cropped supervision renders a smaller window and logs checkpoint times
+        state["gaussians"].means[0, :, 2] = 2.0
+        state["ctx_intr"] = np.repeat(np.array([[[1.0, 0, 0.5], [0, 1.0, 0.5], [0, 0, 1]]]), 2, 0)
+        sizes = []
+
+        class CropRunner(MockRunner):
+            def rasterization(self, *a, **kw):
+                sizes.append((a[7], a[8]))
+                return super().rasterization(*a, **kw)
+        snaps, log = optimize(CropRunner(), state, np.full((2, 64, 64, 3), 0.2, np.float32), 64, [3], train,
+                              {"crop": {"enabled": True, "margin_px": 4}})
+        self.assertLess(sizes[0][0] * sizes[0][1], 64 * 64)
+        self.assertIn("box", log[0])
+        self.assertIn("time_s", log[-1])
+
+    def test_tto_crop_box_is_exact_subwindow(self):
+        import torch
+        from lgs.tto import crop_boxes
+        pts = torch.tensor([[-0.2, -0.1, 2.0], [0.3, 0.2, 2.0], [0.0, 0.0, 4.0]])
+        vm = torch.eye(4)[None].repeat(2, 1, 1)
+        vm[1, 0, 3] = 0.25  # second camera shifted: same box size, different position
+        K = torch.tensor([[100.0, 0, 50], [0, 100.0, 50], [0, 0, 1]])[None].repeat(2, 1, 1)
+        w, h, xy = crop_boxes(pts, vm, K, 100, margin=2, q=0.0)
+        uv = 100 * pts[:, :2] / pts[:, 2:] + 50
+        self.assertGreaterEqual(w, int(uv[:, 0].max() - uv[:, 0].min()) + 4)
+        self.assertGreaterEqual(h, int(uv[:, 1].max() - uv[:, 1].min()) + 4)
+        for (x, y), shift in zip(xy, (0.0, 0.25)):
+            u = 100 * (pts[:, 0] + shift) / pts[:, 2] + 50
+            self.assertTrue(bool(((u >= x) & (u < x + w)).all()) and bool(((uv[:, 1] >= y) & (uv[:, 1] < y + h)).all()))
+
     def test_target_poses_calib_identity_frame(self):
         from scripts.run_anysplat import target_poses
         c2w = np.repeat(np.eye(4)[None], 4, 0)

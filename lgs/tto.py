@@ -14,7 +14,13 @@ Parameterisation (keeps the first render bit-identical to the feed-forward one):
 Only Gaussians in `train_mask` (the token reconstruction region in the default local scope) are
 optimised; all others stay fixed but are still rendered. No densification or pruning, so the
 per-variant keep masks computed before TTO stay valid. Loss: (1 - w) L1 + w (1 - SSIM).
+
+Round 11 (speed): with ocfg["crop"] each input view is rendered and supervised only inside one box around
+the projected trainable Gaussians (plus a margin), instead of the full ~900 px crop; the principal point
+is shifted so the box is an exact sub-window of the full view. The wall time to every checkpoint is
+logged (CUDA synchronised).
 """
+import time
 from types import SimpleNamespace
 
 import numpy as np
@@ -54,12 +60,40 @@ def cov_from(L0, A):
     return M @ M.transpose(-1, -2)
 
 
+def crop_boxes(means, viewmats, Ks, res, margin, q=0.002):
+    """Common (w, h) and per-view top-left (x, y) of a box holding the projections of `means` in every
+    view (quantiles q..1-q against outliers) plus `margin` px; boxes are clamped inside the res x res view."""
+    pts = torch.cat([means, torch.ones_like(means[:, :1])], 1)
+    lo, hi = [], []
+    for vm, K in zip(viewmats, Ks):
+        cam = (vm @ pts.T).T[:, :3]
+        ok = cam[:, 2] > 1e-6
+        if int(ok.sum()) == 0:
+            lo.append(torch.zeros(2, device=means.device))
+            hi.append(torch.full((2,), float(res), device=means.device))
+            continue
+        uv = (K @ cam[ok].T).T
+        uv = uv[:, :2] / uv[:, 2:3]
+        lo.append(torch.quantile(uv, q, dim=0) - margin)
+        hi.append(torch.quantile(uv, 1 - q, dim=0) + margin)
+    lo = torch.stack(lo).clamp(0, res).floor()
+    hi = torch.stack(hi).clamp(0, res).ceil()
+    w, h = [int(min(res, max(16, float((hi - lo)[:, i].max())))) for i in (0, 1)]
+    xy = [(int(min(max(0, float(a[0])), res - w)), int(min(max(0, float(a[1])), res - h))) for a in lo]
+    return w, h, xy
+
+
 def optimize(runner, state, images, res, checkpoints, train_mask, ocfg, eps2d=0.3, mode="classic"):
     """Refine `state["gaussians"]` on the context views. images: context crops (V,res,res,3) float [0,1].
 
     Returns ({iteration: gaussians namespace}, log) where each namespace has the attributes the
-    renderer reads (means, covariances, opacities, rotations, scales, harmonics; batch dim 1)."""
-    dev = runner.device
+    renderer reads (means, covariances, opacities, rotations, scales, harmonics; batch dim 1); log
+    entries carry the loss, the input PSNR on the supervised (cropped) area and, at checkpoints, the
+    wall time since the start of the call."""
+    cuda = torch.cuda.is_available() and str(runner.device).startswith("cuda")
+    if cuda:
+        torch.cuda.synchronize()
+    t_start = time.time()
     g = state["gaussians"]
     means0 = g.means[0].float().detach()
     cov0 = g.covariances[0].float().detach()
@@ -91,6 +125,16 @@ def optimize(runner, state, images, res, checkpoints, train_mask, ocfg, eps2d=0.
     nv = len(gt)
     bg = runner.model.decoder.background_color.float().to(means0.device)[None].expand(nv, -1)
     sh_degree = int(round(np.sqrt(feat0.shape[1]))) - 1
+    W = H = int(res)
+    ccfg = ocfg.get("crop") or {}
+    box = None
+    if ccfg.get("enabled") and len(idx):
+        W, H, xy = crop_boxes(means0[idx], viewmats, Ks, int(res), float(ccfg.get("margin_px", 32)),
+                              float(ccfg.get("quantile", 0.002)))
+        Ks[:, 0, 2] -= torch.as_tensor([x for x, _ in xy], device=Ks.device, dtype=Ks.dtype)
+        Ks[:, 1, 2] -= torch.as_tensor([y for _, y in xy], device=Ks.device, dtype=Ks.dtype)
+        gt = torch.stack([gt[i, y:y + H, x:x + W] for i, (x, y) in enumerate(xy)])
+        box = {"w": W, "h": H, "xy": xy, "area_frac": W * H / float(res) ** 2}
     quats0 = g.rotations[0].float().detach()
     scales0 = g.scales[0].float().detach()
     w_ssim = float(ocfg.get("ssim_weight", 0.2))
@@ -107,7 +151,7 @@ def optimize(runner, state, images, res, checkpoints, train_mask, ocfg, eps2d=0.
     last = max(checkpoints)
     for it in range(1, last + 1):
         means, cov, op, feat = assemble()
-        out, _, _ = runner.rasterization(means, quats0, scales0, op, feat, viewmats, Ks, int(res), int(res),
+        out, _, _ = runner.rasterization(means, quats0, scales0, op, feat, viewmats, Ks, W, H,
                                          sh_degree=sh_degree, packed=False, near_plane=1e-10, backgrounds=bg,
                                          radius_clip=0.1, covars=cov, rasterize_mode=mode, eps2d=float(eps2d))
         pred = out[..., :3].clamp(0, 1)
@@ -116,9 +160,17 @@ def optimize(runner, state, images, res, checkpoints, train_mask, ocfg, eps2d=0.
         opt.zero_grad(set_to_none=True)
         loss.backward()
         opt.step()
+        if it in checkpoints and cuda:
+            torch.cuda.synchronize()
+        t_it = time.time() - t_start
         if it == 1 or it in checkpoints or it % 100 == 0:
             mse = ((pred.detach() - gt) ** 2).mean(dim=(1, 2, 3)).clamp(min=1e-10)
-            log.append({"iter": it, "loss": float(loss.detach()), "ctx_psnr": [float(x) for x in -10 * torch.log10(mse)]})
+            e = {"iter": it, "loss": float(loss.detach()), "ctx_psnr": [float(x) for x in -10 * torch.log10(mse)]}
+            if it in checkpoints:
+                e["time_s"] = t_it
+            if it == 1 and box is not None:
+                e["box"] = box
+            log.append(e)
         if it in checkpoints:
             with torch.no_grad():
                 means, cov, op, feat = assemble()
