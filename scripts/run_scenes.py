@@ -78,6 +78,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--config", required=True)
     ap.add_argument("--shots", nargs="+")
+    ap.add_argument("--host", help="只跑 dataset6.hosts.<host> 里的场景（如 linux-4090 / linux-3090）")
     ap.add_argument("--steps", nargs="+", default=list(STEPS))
     ap.add_argument("--summary-only", action="store_true")
     args = ap.parse_args()
@@ -87,7 +88,7 @@ def main():
     dcfg = base["dataset6"]
     root = Path(dcfg.get("work_root", "work/dataset6"))
     root = root if root.is_absolute() else REPO / root
-    shots = args.shots or dcfg["shots"]
+    shots = args.shots or (dcfg["hosts"][args.host] if args.host else dcfg["shots"])
     with open(data_root / dcfg["calib"], encoding="utf-8") as f:
         calib = json.load(f)
     env = {k: v for k, v in os.environ.items() if k != "LGS_WORK_DIR"}  # every shot uses its own work_dir
@@ -195,30 +196,35 @@ def summarize(root, shots, base):
     setups = sorted({k[1] for k in per})
     stages = sorted({k[3] for k in per if k[3] != "flow"})
     rows = [("flow", "—")] + [(s, h) for s in stages for h in ("直接", "oracle")]
+    pilot = [x for x in shots if x in set(base["dataset6"].get("pilot_shots") or [])]
+    subsets = [("全部场景合计", shots)] + ([("第七轮试点场景合计（检测 CNN 未用它们训练，cnw_cnn 只看这一张表）", pilot)]
+                                       if pilot and len(pilot) < len(shots) else [])
     for setup in setups:
-        lines += [f"## {setup}：全部场景合计（每个目标视点等权）", "",
-                  "| token 变体 | 方法 | 贴回 | 贴回区 | fg PSNR / LPIPS | object PSNR / LPIPS | rest PSNR | 不差目标数 |",
-                  "|---|---|---|---:|---:|---:|---:|---:|"]
-        for v in variants:
-            for stage, how in rows:
-                if stage == "flow" and v != variants[0]:
-                    continue
-                d, fl, pa = {}, {}, []
-                for shot in shots:
-                    fs = per.get((shot, setup, v, "flow", "—"), {})
-                    ds = per.get((shot, setup, v, stage, how), {})
-                    d.update({((shot, k), r): x for (k, r), x in ds.items()})
-                    fl.update({((shot, k), r): x for (k, r), x in fs.items()})
-                    pa += list(area.get((shot, setup, v, stage, how), {}).values())
-                if not d:
-                    continue
-                ks = sorted({k for (k, r) in d if r == "fg"})
-                rest = avg(d, "rest")
-                lines.append(f"| {'—' if stage == 'flow' else v} | {name(stage)} | {how} | "
-                             f"{f'{np.mean(pa) * 100:.1f}%' if pa else '—'} | {cell(avg(d, 'fg'))} | "
-                             f"{cell(avg(d, 'object'))} | {f'{rest[0]:.2f}' if rest else '—'} | "
-                             f"{'—' if stage == 'flow' else f'{not_worse(d, fl, ks)}/{len(ks)}'} |")
-        lines += ["", f"## {setup}：逐场景", "",
+        for title, sub in subsets:
+            lines += [f"## {setup}：{title}（{len(sub)} 组场景，每个目标视点等权）", "",
+                      "| token 变体 | 方法 | 贴回 | 贴回区 | fg PSNR / LPIPS | object PSNR / LPIPS | rest PSNR | 不差目标数 |",
+                      "|---|---|---|---:|---:|---:|---:|---:|"]
+            for v in variants:
+                for stage, how in rows:
+                    if stage == "flow" and v != variants[0]:
+                        continue
+                    d, fl, pa = {}, {}, []
+                    for shot in sub:
+                        fs = per.get((shot, setup, v, "flow", "—"), {})
+                        ds = per.get((shot, setup, v, stage, how), {})
+                        d.update({((shot, k), r): x for (k, r), x in ds.items()})
+                        fl.update({((shot, k), r): x for (k, r), x in fs.items()})
+                        pa += list(area.get((shot, setup, v, stage, how), {}).values())
+                    if not d:
+                        continue
+                    ks = sorted({k for (k, r) in d if r == "fg"})
+                    rest = avg(d, "rest")
+                    lines.append(f"| {'—' if stage == 'flow' else v} | {name(stage)} | {how} | "
+                                 f"{f'{np.mean(pa) * 100:.1f}%' if pa else '—'} | {cell(avg(d, 'fg'))} | "
+                                 f"{cell(avg(d, 'object'))} | {f'{rest[0]:.2f}' if rest else '—'} | "
+                                 f"{'—' if stage == 'flow' else f'{not_worse(d, fl, ks)}/{len(ks)}'} |")
+            lines.append("")
+        lines += [f"## {setup}：逐场景", "",
                   "| 场景 | token 变体 | 方法 | 贴回 | 贴回区 | fg PSNR / LPIPS | object PSNR / LPIPS | rest PSNR | 不差目标数 | TTO 累计耗时 |",
                   "|---|---|---|---|---:|---:|---:|---:|---:|---:|"]
         for shot in shots:

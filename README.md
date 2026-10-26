@@ -14,12 +14,16 @@
 
 ---
 
-## 第十四轮（当前）：换用第七轮的 Cn_wide token + 多窗口编码
+## 第十四轮（当前，修订版 14b）：换用第七轮的 Cn_wide token + 多窗口编码，两台机器都跑六路数据集
 
 | 机器 | 标签 | 跑什么 | 配置 |
 |---|---|---|---|
-| linux-4090 | `linux-4090-round14` | 六路数据集 8 组场景，输入 0/3/5；token 用 rife / cnw_cnn / cnw_f5，单窗口与多窗口各一套 | `configs/dataset6_lean.yaml` |
-| linux-3090 | `linux-3090-round14` | 魔方数据精简流程（复用 `work/round7`）：协方差上限改为每 10 步一次，看每步耗时是否回到第十二轮；同时加多窗口编码 | `configs/mofang_9cam_lean.yaml` |
+| linux-4090 | `linux-4090-round14b` | 六路数据集 changjing / changjing1 中的 23 组（`--host linux-4090`） | `configs/dataset6_lean.yaml` |
+| linux-3090 | `linux-3090-round14b` | 同一数据集的另外 23 组（`--host linux-3090`） | `configs/dataset6_lean.yaml` |
+
+两台机器用同一份代码和配置，只是场景不同；输入 0/3/5，token 用 rife / cnw_cnn / cnw_f5，单窗口与多窗口各一套。旧标签 `linux-*-round14`（8 组场景、3090 跑魔方）已作废，不要用。
+
+**场景范围**：只用人在零视差面附近（约 1.6 m）的 changjing、changjing1 两个场景，共 46 组；人离阵列很近的 changjing2 暂不考虑。其中 6 组是第七轮 token 试点场景（`dataset6.pilot_shots`，两台各 3 组）：检测 CNN 没有用它们训练，所以 `cnw_cnn` 的结论只看汇总里"第七轮试点场景合计"那张表；`rife` 和 `cnw_f5` 不需要训练，可以看全部场景。
 
 **为什么这样改**：
 - 第十三轮 GS 在真实失败区里 PSNR 比光流高，但 LPIPS 打不赢，画面发糊：分散的 token 让编码窗口撑满原图高度（1296 px），压到 448 输入后放大 2.9 倍。
@@ -30,7 +34,7 @@
 1. **token 换成风险图实验第七轮的部署方案 Cn_wide**（新增变体 `cnw_cnn`、`cnw_f5`，保留 `rife` 对照）：
    - Cn_wide = (A_wide ∩ B) ∪ Fn：A 是 VGGT 几何给出的深度边界带 / 遮挡带候选，B 是每对相机 3 个 RIFE 探测视点（t = 0.25 / 0.5 / 0.75）上的失败检测反投回源图，Fn 是窄的强制项。不用标定、不用真值。
    - 掩码在 Windows 机上用 `tools/export_cnw_tokens.py`（调用 `risk_exp/src/r7_e2e.py` 的原代码）对输入 0/3/5 的两对相机逐对算好，原图坐标，已随仓库提交在 `data/tokens_cnw/`，Linux 上不需要 VGGT 和检测 CNN。
-   - 检测 CNN 是用另外 40 组场景训练的，所以本轮场景换成第七轮的 8 组试点场景（第十三轮的 5 组里有 3 组在它的训练集中）。
+   - 46 组场景的掩码都已导出。检测 CNN 是用第七轮试点以外的场景训练的，见上面"场景范围"。
 2. **多窗口编码**（`gs.multi_window`，局部渲染标签 `tok<变体>_mw`）：
    - 把三台输入相机的重建区并集按连通块分组，合并后的正方形不超过 640 px 才合并，最多 4 个窗口；每个窗口单独编码、单独 TTO、单独渲染，再按 alpha 合成为一张。
    - 每个 token 像素只属于一个窗口。单个连通块超过 640 px 时（如 changjing2 人离相机很近）保留它自己的大窗口。
@@ -38,36 +42,29 @@
 3. **六路数据各变体分别编码**（`token_window: per_variant`）：三种 token 区域差别大，各用自己的窗口。
 4. **TTO**：协方差上限每 10 步（及每个检查点）才做一次（`cov_every: 10`），去掉每步的主机同步；六路数据 `max_res` 改回 1008。
 
-**4090 跑法**（环境、数据和之前相同，按下面 ★ 一节准备）：
+**两台机器的跑法**（4090 按下面 ★ 一节准备好环境和数据；3090 需要同样的数据：`$DATA_ROOT/datasets/changjing`、`changjing1`，`$DATA_ROOT/datasets_1080/calib/`，以及 `Practical-RIFE`、`AnySplat`。配置里 `data_root` 默认是 `/home/han/linux-han`，不同时用环境变量 `LGS_DATA_ROOT` 指定）：
 
 ```bash
-cd $DATA_ROOT/local-gs-eval && git fetch --tags -f && git checkout linux-4090-round14
-ls data/tokens_cnw            # 应有 8 个场景目录
+# 4090：HOST=linux-4090；3090：HOST=linux-3090
+cd $DATA_ROOT/local-gs-eval && git fetch --tags -f && git checkout ${HOST}-round14b
+ls data/tokens_cnw | wc -l           # 应为 48（含 changjing2 的 2 组，本轮不用）
+ls $DATA_ROOT/datasets/changjing1 | head -3
 rm -rf work/dataset6
 python -m unittest discover -s tests -v
-python scripts/run_scenes.py --config configs/dataset6_lean.yaml 2>&1 | tee work/dataset6_run.log
+export HF_HUB_OFFLINE=1 PYTHONUNBUFFERED=1
+python scripts/run_scenes.py --config configs/dataset6_lean.yaml --host $HOST 2>&1 | tee work/dataset6_run.log
 ```
 
-结果上传到 `experiment/linux-4090-round14-<日期>`，内容同 ★ 一节第 6 步。`summary_all.md` 按变体列表：`rife`、`cnw_cnn`、`cnw_f5`，以及对应的多窗口 `*_mw`；耗时表的"编码窗口边长"在多窗口时列出每个窗口的边长（如 `448+512`）。
+- 每台 23 组场景，预计 1.5–2 小时（每组约 4–5 分钟）。中途断了可以用 `--shots` 只补跑缺的场景，最后用 `--host $HOST --summary-only` 重新汇总。
+- 结果上传到 `experiment/${HOST}-round14b-<日期>`，内容同 ★ 一节第 6 步。
+- `summary_all.md` 按变体列表：`rife`、`cnw_cnn`、`cnw_f5`，以及对应的多窗口 `*_mw`；耗时表的"编码窗口边长"在多窗口时列出每个窗口的边长（如 `877+475`）。
 
-**3090 跑法**：
-
-```bash
-cd /home/han/linux-han/local-gs-eval && git fetch --tags -f && git checkout linux-3090-round14
-export LGS_WORK_DIR=work/round14 HF_HUB_OFFLINE=1 PYTHONUNBUFFERED=1
-mkdir -p $LGS_WORK_DIR && cp -r work/round7/{prepare,flow,poses,tokens,compat_packages} $LGS_WORK_DIR/
-python -m unittest discover -s tests -v
-python scripts/run_anysplat.py --config configs/mofang_9cam_lean.yaml 2>&1 | tee $LGS_WORK_DIR/1_anysplat.log
-python scripts/evaluate.py --config configs/mofang_9cam_lean.yaml 2>&1 | tee $LGS_WORK_DIR/3_evaluate.log
-python scripts/validate_results.py configs/mofang_9cam_lean.yaml
-```
-
-结果上传到 `experiment/linux-3090-round14-<日期>`。
+**本机试跑（只跑了 prepare 和 token 两步）**：多窗口能让最大窗口从 1296 降到 800–1150 左右，并把远处的零散区域（肩膀、三脚架）分到 450 px 左右的小窗口；但 token 区域在三台相机原图上的位置相差几百像素，合起来常连成一整块，所以窗口缩不到 640 以内。这一轮能回答的是：放大倍数从约 2.9 降到约 2.0 时，GS 是否明显变清楚。
 
 **判断标准**：
 1. **多窗口是否解决发糊**：同一 token 变体，`*_mw` 对比单窗口，看 oracle 贴回的 LPIPS 能否不差于光流；直接贴回的不差目标数是否增加。
 2. **Cn_wide 是否比 rife 更适合做 GS 区域**：贴回区面积、fg PSNR / LPIPS、不差目标数；`cnw_f5` 不需要训练，作为可推广的参照。
-3. **速度**：3090 魔方每步耗时是否回到约 48 / 61 ms（cam3 / cam5），质量是否与第十三轮相同；4090 上多窗口的编码与 TTO 总耗时。
+3. **速度**：每步 TTO 耗时是否比第十三轮短（协方差上限每 10 步一次）；多窗口的编码与 TTO 总耗时。
 
 ## 第十三轮：TTO 防漂浮物 + 六路数据收窄贴回区
 

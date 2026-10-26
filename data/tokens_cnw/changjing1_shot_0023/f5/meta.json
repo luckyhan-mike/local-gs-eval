@@ -1,0 +1,29 @@
+{
+ "shot": "changjing1/shot_0023",
+ "cams": [
+  0,
+  3,
+  5
+ ],
+ "det": "f5",
+ "scheme": "Cn_wide (r7_e2e: A_wide & B | Fn)",
+ "tau": 0.16,
+ "theta_big": 192,
+ "theta_g": {
+  "0-3": 32,
+  "3-5": 24
+ },
+ "probes": [
+  0.25,
+  0.5,
+  0.75
+ ],
+ "area_frac_of_raw": {
+  "0-3/cam0": 0.011830940822187929,
+  "0-3/cam3": 0.010366097072187929,
+  "3-5/cam3": 0.0063104825745884776,
+  "3-5/cam5": 0.0038483126500342938
+ },
+ "time_s_all_dets_incl_read": 5.20904420001898,
+ "gpu": "NVIDIA GeForce RTX 3090"
+}

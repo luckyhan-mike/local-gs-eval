@@ -16,15 +16,111 @@ dataset6:
   calib: datasets_1080/calib/calib_1920x1080.json   # 仅用于评估：用标定光心定出被抽掉的真实相机在哪个 t（目标光心投影到两侧输入光心连线上），
                                                     # 即评估要生成的目标视点位置；光流和 GS 用同一个 t。方法本身（token、GS 位姿、贴回）不用标定
   work_root: work/dataset6                          # 每组场景的工作目录 = work_root/<scene>_<shot>
-  shots:                                            # 第十四轮：改用第七轮 token 试点的 8 组场景（Cn_wide 的检测 CNN 没有用它们训练，第十三轮的 5 组里有 3 组在其训练集中）
-    - changjing2/shot_0000     # 人离相机很近，头与墙视差大（第十三轮也有）
-    - changjing2/shot_0004
+  # 第十四轮（修订）：只用人在零视差面附近（约 1.6 m）的 changjing / changjing1 两个场景的全部 46 组；
+  # 人离阵列很近的 changjing2 暂不考虑。两台机器各跑一半（run_scenes.py --host linux-4090 / linux-3090）。
+  shots:
+    - changjing/shot_0000
+    - changjing/shot_0001
+    - changjing/shot_0002
+    - changjing/shot_0003
+    - changjing/shot_0004
+    - changjing/shot_0005
+    - changjing/shot_0006
+    - changjing/shot_0007
+    - changjing/shot_0008
+    - changjing/shot_0009
+    - changjing/shot_0010
+    - changjing/shot_0011
+    - changjing/shot_0012
+    - changjing1/shot_0000
+    - changjing1/shot_0001
+    - changjing1/shot_0002
+    - changjing1/shot_0003
+    - changjing1/shot_0004
+    - changjing1/shot_0005
+    - changjing1/shot_0006
+    - changjing1/shot_0007
+    - changjing1/shot_0008
+    - changjing1/shot_0009
+    - changjing1/shot_0010
+    - changjing1/shot_0011
+    - changjing1/shot_0012
+    - changjing1/shot_0013
+    - changjing1/shot_0014
+    - changjing1/shot_0015
+    - changjing1/shot_0016
+    - changjing1/shot_0017
+    - changjing1/shot_0018
+    - changjing1/shot_0019
+    - changjing1/shot_0020
+    - changjing1/shot_0021
+    - changjing1/shot_0022
+    - changjing1/shot_0023
+    - changjing1/shot_0024
+    - changjing1/shot_0025
+    - changjing1/shot_0026
+    - changjing1/shot_0027
+    - changjing1/shot_0028
+    - changjing1/shot_0029
+    - changjing1/shot_0030
+    - changjing1/shot_0031
+    - changjing1/shot_0032
+  pilot_shots:                                      # 第七轮 token 试点场景：Cn_wide 的检测 CNN 没有用它们训练；cnw_cnn 的结论只看这几组
     - changjing1/shot_0001
     - changjing1/shot_0021
     - changjing1/shot_0022
-    - changjing1/shot_0032     # 书挡在脸前（第十三轮也有）
-    - changjing/shot_0000      # 简单场景，几乎不失败
+    - changjing1/shot_0032
+    - changjing/shot_0000
     - changjing1/shot_0018
+  hosts:
+    linux-4090:
+      - changjing/shot_0000
+      - changjing/shot_0001
+      - changjing/shot_0003
+      - changjing/shot_0005
+      - changjing/shot_0007
+      - changjing/shot_0009
+      - changjing/shot_0011
+      - changjing1/shot_0000
+      - changjing1/shot_0001
+      - changjing1/shot_0003
+      - changjing1/shot_0005
+      - changjing1/shot_0007
+      - changjing1/shot_0009
+      - changjing1/shot_0011
+      - changjing1/shot_0013
+      - changjing1/shot_0015
+      - changjing1/shot_0017
+      - changjing1/shot_0020
+      - changjing1/shot_0022
+      - changjing1/shot_0024
+      - changjing1/shot_0026
+      - changjing1/shot_0028
+      - changjing1/shot_0030
+    linux-3090:
+      - changjing/shot_0002
+      - changjing/shot_0004
+      - changjing/shot_0006
+      - changjing/shot_0008
+      - changjing/shot_0010
+      - changjing/shot_0012
+      - changjing1/shot_0002
+      - changjing1/shot_0004
+      - changjing1/shot_0006
+      - changjing1/shot_0008
+      - changjing1/shot_0010
+      - changjing1/shot_0012
+      - changjing1/shot_0014
+      - changjing1/shot_0016
+      - changjing1/shot_0018
+      - changjing1/shot_0019
+      - changjing1/shot_0021
+      - changjing1/shot_0023
+      - changjing1/shot_0025
+      - changjing1/shot_0027
+      - changjing1/shot_0029
+      - changjing1/shot_0031
+      - changjing1/shot_0032
 
 rife_dir: Practical-RIFE                # 需包含 train_log/IFNet_HDv3.py 与 train_log/flownet.pkl
 anysplat_dir: AnySplat                  # AnySplat 源码根目录
