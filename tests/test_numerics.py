@@ -557,6 +557,31 @@ class NumericsTests(unittest.TestCase):
         self.assertGreater(float((snaps[37].covariances[0].diagonal(dim1=-2, dim2=-1) / cov.diagonal(dim1=-2, dim2=-1)).max()),
                            1.5 ** 2 * 0.9)  # the pull reached the cap
 
+    def test_pixgs_moves_occludes_and_fills(self):
+        from lgs.pixgs import depth_sign, fill_background, make_set, render_view
+        h, w = 40, 80
+        # source a: wall (displacement +4 px from a to b) and a near square (displacement -10 px); b is the same scene
+        img_a = np.zeros((h, w, 3), np.float32); img_a[:] = 0.2
+        img_a[10:20, 30:40] = 0.9
+        ga = np.zeros((2, h, w), np.float32); ga[0] = 4.0; ga[0, 10:20, 30:40] = -10.0
+        img_b = np.zeros((h, w, 3), np.float32); img_b[:] = 0.2
+        img_b[10:20, 20:30] = 0.9
+        gb = np.zeros((2, h, w), np.float32); gb[0] = -4.0; gb[0, 10:20, 20:30] = 10.0
+        gb[0, 10:20, 30:34] = np.nan                              # b pixels hidden behind the square in a
+        fg = np.zeros((h, w), bool); fg[10:20, 30:40] = True
+        sign = depth_sign(ga[0], fg, np.isfinite(ga[0]))
+        self.assertEqual(sign, -1.0)                               # key = -g_x: square (+10) in front of the wall (-4)
+        need = np.ones((h, w), bool)
+        gb_f = fill_background(gb, need, -sign, 32)
+        self.assertTrue(np.allclose(gb_f[0, 10:20, 30:34], -4.0))  # filled from the wall side, not the square
+        t = 0.5
+        sets = [make_set(img_a, ga, need, t, sign, 0.5, 3.0), make_set(img_b, gb_f, need, 1 - t, -sign, 0.5, 3.0)]
+        rgb, alpha, backend = render_view(sets, t, (h, w), {"depth_tol_px": 3.0}, backend="torch")
+        self.assertEqual(backend, "torch")
+        self.assertTrue(np.allclose(rgb[12:18, 27:33], 0.9, atol=0.05))   # square at x + t*g = 25..35 (centre kept)
+        self.assertTrue(np.allclose(rgb[12:18, 50:60], 0.2, atol=0.05))   # wall
+        self.assertGreater(float(alpha[12:18, 27:33].min()), 0.9)
+
 
 if __name__ == '__main__':
     unittest.main()

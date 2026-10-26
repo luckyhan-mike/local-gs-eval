@@ -4,12 +4,12 @@
 Every shot in cfg["dataset6"]["shots"] (e.g. changjing1/shot_0012) gets its own work directory
 work_root/<scene>_<shot> with a filled-in copy of the config, the interpolation time t of every target
 from the calibrated camera centres (poses/<setup>.json, so no target image is used), and then the usual
-steps: prepare -> detect_tokens -> run_anysplat -> run_flow (reference flow only) -> evaluate ->
+steps: prepare -> detect_tokens -> run_anysplat -> run_pixgs -> run_flow (reference flow only) -> evaluate ->
 validate_results. Afterwards work_root/summary_all.md lists flow / feed-forward / TTO per shot and over
 all shots, with the TTO wall times.
 
 Usage: python scripts/run_scenes.py --config configs/dataset6_lean.yaml [--shots changjing/shot_0007 ...]
-       [--steps prepare tokens anysplat flow evaluate validate] [--summary-only]
+       [--steps prepare tokens anysplat pixgs flow evaluate validate] [--summary-only]
 """
 import argparse
 import csv
@@ -33,6 +33,7 @@ STEPS = {
     "prepare": ["scripts/prepare.py", "--config", "{cfg}"],
     "tokens": ["scripts/detect_tokens.py", "--config", "{cfg}"],
     "anysplat": ["scripts/run_anysplat.py", "--config", "{cfg}"],
+    "pixgs": ["scripts/run_pixgs.py", "--config", "{cfg}"],
     "flow": ["scripts/run_flow.py", "--config", "{cfg}", "--scales", "1.0", "--tmodes", "pose"],
     "evaluate": ["scripts/evaluate.py", "--config", "{cfg}"],
     "validate": ["scripts/validate_results.py", "{cfg}"],
@@ -125,6 +126,9 @@ def summarize(root, shots, base):
     variants = base["gs"].get("local_variants") or [main_v]
     if (base["gs"].get("multi_window") or {}).get("enabled"):  # round 14: window-by-window encode of the same tokens
         variants = [x for v in variants for x in (v, f"{v}_mw")]
+    pix = base["gs"].get("pixgs") or {}
+    if pix.get("enabled"):  # round 15: pixel-wise Gaussians in the aligned space
+        variants = variants + [f"{v}_pix" for v in pix.get("variants", [])]
     size = base["gs"]["sizes"][0]
     pats = {v: re.compile(rf"^(hyb_token|hyb_tokchk_oracle)\[gs_tok{re.escape(v)}{size}_.+_al(?:_tto(\d+))?_local\]$")
             for v in variants}

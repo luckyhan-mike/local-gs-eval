@@ -56,6 +56,10 @@ def main():
                 variants += [f"gs_{lab}{t}_local" for lab in labs for t in tails]
                 for it in (gcfg.get("tto") or {}).get("checkpoints") or []:  # TTO checkpoint renders
                     variants += [f"gs_{lab}{t}_tto{it}_local" for lab in labs for t in tails]
+                pix = gcfg.get("pixgs") or {}
+                if pix.get("enabled"):  # round 15: run_pixgs.py
+                    variants += [f"gs_tok{v}_pix{gcfg['sizes'][0]}_pix_al_local" for v in pix.get("variants", [])
+                                 if v in tok_vars]
             else:
                 full = [f"gs_{lab}{t}" for lab in (labels if crop == "token" else [crop]) for t in tails]
                 variants += full + ([v + "_local" for v in full] if tok_root.exists() else [])

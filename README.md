@@ -14,7 +14,53 @@
 
 ---
 
-## 第十四轮（当前，修订版 14b）：换用第七轮的 Cn_wide token + 多窗口编码，两台机器都跑六路数据集
+## 第十五轮（当前）：视差空间逐像素高斯（pixgs 变体）
+
+| 机器 | 标签 | 跑什么 | 结果上传到 |
+|---|---|---|---|
+| linux-4090 | `linux-4090-round15-pixgs` | 六路数据集 23 组（`--host linux-4090`） | `experiment/linux-4090-round15-pixgs-<日期>` |
+| linux-3090 | `linux-3090-round15-pixgs` | 另外 23 组（`--host linux-3090`） | `experiment/linux-3090-round15-pixgs-<日期>` |
+
+代码和配置同第十四轮修订版（14b），只是多了一个步骤 `pixgs`：在同一 token 区域上，用"逐像素高斯"代替 AnySplat。
+
+**做法**（`lgs/pixgs.py`、`scripts/run_pixgs.py`）：
+- 只为 token 重建区（core + 48 px 环带）的像素生成高斯，一个像素一个，颜色取原像素，半径约 0.5 px。不用网络，不开编码窗口，不缩放，原分辨率。
+- 位置：对齐坐标里，像素 x 在目标视点的位置 = x + t × 立体对应位移 g(x)，t 与光流分支相同；输入 a、b 两侧的像素各自移动，前后顺序由位移本身决定（墙在零视差面后面，位移最小），不用相机模型、不用标定。
+- 位移：FoundationStereo（风险图实验 P3 推荐配置 rec_pp，每对相机约 0.4 s），在 Windows 上算好，只保存在 Cn_wide 区域附近，量化到 1/4 像素，随仓库提交在 `data/disp_fs/`（46 组共 22 MB）。所以只对 `cnw_cnn`、`cnw_f5` 两个 token 变体做 pixgs。
+- 渲染用 gsplat；两侧结果逐像素合并：明显更近的一侧优先，深度相近时按 (1−t)、t 混合。某一侧看不到的像素（例如被前景挡住的墙）沿行用背景侧的位移补上。
+- 本轮不做 TTO。输出目录 `gs_tok<变体>_pix448_pix_al_local`，汇总里显示为 `cnw_cnn_pix`、`cnw_f5_pix`（"448"只是为了沿用命名，pixgs 没有 448 输入）。
+
+**跑法**：
+
+```bash
+# 4090：HOST=linux-4090；3090：HOST=linux-3090
+cd $DATA_ROOT/local-gs-eval && git fetch --tags -f && git checkout ${HOST}-round15-pixgs
+ls data/disp_fs | wc -l               # 应为 46
+python -m unittest discover -s tests -v
+export HF_HUB_OFFLINE=1 PYTHONUNBUFFERED=1
+```
+
+- **第十四轮（14b）已经在这台机器上跑完**（`work/dataset6` 里有结果）：只补 pixgs，再重新评估，每组约 1–2 分钟：
+
+  ```bash
+  python scripts/run_scenes.py --config configs/dataset6_lean.yaml --host $HOST --steps pixgs evaluate validate 2>&1 | tee work/dataset6_pixgs.log
+  ```
+
+- **还没跑过 14b**：从头全部跑一遍（含 AnySplat 单窗口 / 多窗口，每台约 1.5–2 小时）：
+
+  ```bash
+  rm -rf work/dataset6
+  python scripts/run_scenes.py --config configs/dataset6_lean.yaml --host $HOST 2>&1 | tee work/dataset6_run.log
+  ```
+
+两种情况都上传整个 `work/dataset6` 的结果（内容同 ★ 一节第 6 步）到上表的分支。
+
+**判断标准**：
+1. **质量**：`cnw_cnn_pix` 对比 `cnw_cnn`（AnySplat 单窗口）、`cnw_cnn_mw`（多窗口）和纯光流：oracle 贴回和直接贴回的 fg PSNR / LPIPS、不差目标数。重点看 LPIPS：之前 GS 输在发糊，pixgs 是原分辨率。
+2. **速度**：耗时表里 pixgs 的"每视点渲染"时间（目标：每个虚拟视点几十毫秒以内）；立体位移的时间记在 meta 的 `time_encode_s`（Windows 3090 上测的）。
+3. **缺失**：日志里每个目标的 `miss a/b`（重建区里没有位移、被丢掉的像素比例），太大说明立体在那里没有结果。
+
+## 第十四轮（修订版 14b）：换用第七轮的 Cn_wide token + 多窗口编码，两台机器都跑六路数据集
 
 | 机器 | 标签 | 跑什么 | 配置 |
 |---|---|---|---|
