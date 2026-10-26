@@ -70,6 +70,7 @@ def shot_config(base, shot, work):
     cfg["raw_pattern"] = f"{Path(base['dataset6'].get('root', 'datasets')).as_posix()}/{shot}/view_{{}}.png"
     cfg["aligned_pattern"] = str((work / "aligned" / "aligned_{:02d}.png").as_posix())
     cfg["work_dir"] = str(work.as_posix())
+    cfg["shot"] = shot  # external token masks are looked up by shot (tokens.variants.*.external)
     return cfg
 
 
@@ -121,6 +122,8 @@ def summarize(root, shots, base):
     ref = base["eval"]["ref_flow"]
     main_v = base["eval"].get("tto_main_variant", "rife")
     variants = base["gs"].get("local_variants") or [main_v]
+    if (base["gs"].get("multi_window") or {}).get("enabled"):  # round 14: window-by-window encode of the same tokens
+        variants = [x for v in variants for x in (v, f"{v}_mw")]
     size = base["gs"]["sizes"][0]
     pats = {v: re.compile(rf"^(hyb_token|hyb_tokchk_oracle)\[gs_tok{re.escape(v)}{size}_.+_al(?:_tto(\d+))?_local\]$")
             for v in variants}
@@ -156,14 +159,16 @@ def summarize(root, shots, base):
                         st = int(m.group(1) or 0)
                         area[(shot, r["setup"], v, st, "直接")][int(r["target"])] = float(r["core_frac_fg"])
                         area[(shot, r["setup"], v, st, "oracle")][int(r["target"])] = float(r["paste_frac_fg"])
-        for meta in (work / "gs").glob(f"*/gs_tok{main_v}{size}_*_al_tto*_local/meta.json"):
-            m = json.loads(meta.read_text(encoding="utf-8"))
-            setup = meta.parts[-3]
-            if m.get("tto"):
-                times[(shot, setup)] = {e["iter"]: e["time_s"] for e in m["tto"]["log"] if "time_s" in e}
-                times[(shot, setup)]["box"] = (m["tto"]["log"][0].get("box") or {}).get("area_frac")
-                times[(shot, setup)]["encode"] = m.get("time_encode_s")
-                times[(shot, setup)]["window"] = (m.get("window") or [None, None, None])[2]
+        for v in variants:
+            for meta in (work / "gs").glob(f"*/gs_tok{v}{size}_*_al_tto*_local/meta.json"):
+                m = json.loads(meta.read_text(encoding="utf-8"))
+                setup = meta.parts[-3]
+                if m.get("tto"):
+                    key = (shot, setup, v)
+                    times[key] = {e["iter"]: e["time_s"] for e in m["tto"]["log"] if "time_s" in e}
+                    times[key]["box"] = (m["tto"]["log"][0].get("box") or {}).get("area_frac")
+                    times[key]["encode"] = m.get("time_encode_s")
+                    times[key]["window"] = "+".join(str(w[2]) for w in m["windows"]) if m.get("windows")                         else (m.get("window") or [None, None, None])[2]
         tf = work / "timing.json"
         if tf.exists():
             times[(shot, "steps")] = json.loads(tf.read_text(encoding="utf-8"))
@@ -229,7 +234,7 @@ def summarize(root, shots, base):
                         continue
                     ks = sorted({k for (k, r) in d if r == "fg"})
                     pa = list(area.get((shot, setup, v, stage, how), {}).values())
-                    tt = times.get((shot, setup), {}).get(stage) if stage not in ("flow", 0) else None
+                    tt = times.get((shot, setup, v), {}).get(stage) if stage not in ("flow", 0) else None
                     rest = avg(d, "rest")
                     lines.append(f"| {shot} | {'—' if stage == 'flow' else v} | {name(stage)} | {how} | "
                                  f"{f'{np.mean(pa) * 100:.1f}%' if pa else '—'} | {cell(avg(d, 'fg'))} | "
@@ -237,14 +242,15 @@ def summarize(root, shots, base):
                                  f"{'—' if stage == 'flow' else f'{not_worse(d, fl, ks)}/{len(ks)}'} | "
                                  f"{f'{tt:.2f} s' if tt is not None else '—'} |")
         lines.append("")
-    lines += ["## 耗时", "", "| 场景 | 设置 | 编码窗口边长 | 编码 | 监督框面积 | TTO 各检查点累计 | 各步骤墙钟时间 |",
-              "|---|---|---:|---:|---:|---|---|"]
-    for (shot, setup), t in sorted(times.items()):
-        if setup == "steps":
+    lines += ["## 耗时", "", "| 场景 | 设置 | token 变体 | 编码窗口边长 | 编码 | 监督框面积 | TTO 各检查点累计 | 各步骤墙钟时间 |",
+              "|---|---|---|---:|---:|---:|---|---|"]
+    for key, t in sorted(times.items(), key=lambda kv: tuple(map(str, kv[0]))):
+        if len(key) != 3:
             continue
+        shot, setup, v = key
         cps = ", ".join(f"{it}: {x:.2f}s" for it, x in sorted((k, x) for k, x in t.items() if isinstance(k, int)))
         st = times.get((shot, "steps"), {})
-        lines.append(f"| {shot} | {setup} | {t.get('window') or '—'} | {t.get('encode') or float('nan'):.2f} s | "
+        lines.append(f"| {shot} | {setup} | {v} | {t.get('window') or '—'} | {t.get('encode') or float('nan'):.2f} s | "
                      f"{(t.get('box') or float('nan')) * 100:.0f}% | {cps} | "
                      + ", ".join(f"{k} {x:.0f}s" for k, x in st.items()) + " |")
     root.mkdir(parents=True, exist_ok=True)

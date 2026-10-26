@@ -73,6 +73,11 @@ gs:
   aligned_pad_px: 160                   # 对齐域渲染画布四周的余量（平面单应会平移画面）
   local_variants: [rife]                # 精简：只对部署变体做局部渲染与 TTO；编码窗口仍按全部变体的并集，与前几轮相同
   render_full: false                    # 精简：不渲染整窗口 GS（早期诊断）
+  multi_window:                         # 第十四轮：按 token 连通块分组、逐窗口编码（窗口小，448 输入几乎不放大）；局部渲染标签 tok<变体>_mw，各窗口渲染合成为一张
+    enabled: true
+    max_side: 640                       # 合并后的正方形边长不超过该值才合并（单个连通块更大时保留它自己的大窗口）
+    max_windows: 4                      # 窗口数上限：超过时强制合并最近的两组
+    pad_px: 16                          # 窗口在连通块外接框外的边距
   token_window: fixed                   # fixed：所有 token 变体共用一次编码（窗口 = 各变体重建区并集），变体只决定选哪些高斯；per_variant：第六轮做法（每个变体按自己的窗口各编码一次，窗口小时 GS 变差）
   reproject:                            # 第九轮：几何来自 3D、纹理取自输入原图（lgs/reproject.py），与 GS 颜色贴回用同一 token 贴回区
     geometries: []                      # 第九轮负面结果（几何不够准，纹理错位），本轮关闭；[gs, vggt] 可恢复
@@ -93,6 +98,7 @@ gs:
     lr: {means: 1.6e-5, cov: 5.0e-3, opacity: 2.5e-2, dc: 2.5e-3}   # means 再乘输入相机基线长度；第十三轮位置学习率降为 3DGS 默认的 1/10
     max_disp_scale: 1.0                 # 第十三轮：每步后把位置偏移限制在该高斯自身尺寸（前馈协方差迹的平方根）以内，防止漂出监督框成为漂浮物
     max_cov_scale: 1.5                  # 第十三轮：协方差每个方向的缩放限制在 [1/1.5, 1.5] 倍，防止拉成长条
+    cov_every: 10                       # 第十四轮：协方差上限每 10 步（及各检查点）才做一次批量 SVD；第十三轮每步做，每步慢了约 25 ms
   keep_mode: visible                    # 局部高斯：visible=输入相机中深度测试后的可见表面；ray=视线穿过即保留（第四轮，足迹过大）
   visible_tol: 0.03                     # 可见性深度容差（相对）
   renders:                              # 每个 (crop, size) 只编码一次；第二、三轮滤波核差异 <0.1 dB，只保留 nat_dil

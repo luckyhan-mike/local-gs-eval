@@ -167,20 +167,20 @@ def optimize(runner, state, images, res, checkpoints, train_mask, ocfg, eps2d=0.
     disp_cap = ocfg.get("max_disp_scale")  # None: unconstrained (rounds 10-12)
     size0 = torch.sqrt(torch.diagonal(cov0[idx], dim1=-2, dim2=-1).sum(-1).clamp(min=1e-20))[:, None]
     cov_cap = ocfg.get("max_cov_scale")
+    cov_every = max(int(ocfg.get("cov_every", 1)), 1)  # round 14: the batched 3x3 SVD cost ~25 ms per step
     eye3 = torch.eye(3, device=means0.device)
 
-    def constrain():
+    def constrain(it):
         with torch.no_grad():
             if disp_cap is not None:
                 d = p["means"] - m0
                 lim = float(disp_cap) * size0
                 n = d.norm(dim=1, keepdim=True).clamp(min=1e-20)
                 p["means"].copy_(m0 + d * torch.clamp(lim / n, max=1.0))
-            if cov_cap is not None:
+            if cov_cap is not None and (it % cov_every == 0 or it in checkpoints):
                 u, sv, vh = torch.linalg.svd(eye3 + p["A"])
                 c = float(cov_cap)
-                if bool((sv > c).any() or (sv < 1.0 / c).any()):
-                    p["A"].copy_(u @ torch.diag_embed(sv.clamp(1.0 / c, c)) @ vh - eye3)
+                p["A"].copy_(u @ torch.diag_embed(sv.clamp(1.0 / c, c)) @ vh - eye3)  # no host sync
 
     def assemble():
         means = means0.index_copy(0, idx, p["means"])
@@ -219,7 +219,7 @@ def optimize(runner, state, images, res, checkpoints, train_mask, ocfg, eps2d=0.
         opt.zero_grad(set_to_none=True)
         loss.backward()
         opt.step()
-        constrain()
+        constrain(it)
         if it in checkpoints and cuda:
             torch.cuda.synchronize()
         t_it = time.time() - t_start

@@ -296,6 +296,102 @@ def load_token_sets(tok_root, ctx, tcfg):
     return {}
 
 
+def group_windows(masks, raw_shape, mcfg, min_side):
+    """Round 14 multi-window encode: split the union of the context cameras' recon masks (raw frame) into
+    connected components and merge them greedily (smallest merged square first) while the merged square stays
+    within max_side px, is no larger than the bigger of the two, or there are more than max_windows groups.
+    Returns [(window (x0, y0, side), region mask)]; region = the components of that window, so every token
+    pixel belongs to exactly one window. A single component larger than max_side keeps its own large window."""
+    union = np.logical_or.reduce(masks)
+    if not union.any():
+        return []
+    n, lab, stats, _ = cv2.connectedComponentsWithStats(union.astype(np.uint8), connectivity=8)
+    groups = [{"box": (s[0], s[1], s[0] + s[2], s[1] + s[3]), "comps": [i]} for i, s in enumerate(stats) if i]
+
+    def side(b):
+        return max(b[2] - b[0], b[3] - b[1])
+
+    def merged(a, b):
+        return (min(a[0], b[0]), min(a[1], b[1]), max(a[2], b[2]), max(a[3], b[3]))
+
+    max_side, max_windows = int(mcfg.get("max_side", 640)), int(mcfg.get("max_windows", 4))
+    while len(groups) > 1:
+        best = min(((side(merged(g["box"], h["box"])), i, j) for i, g in enumerate(groups)
+                    for j, h in enumerate(groups) if j > i))
+        s, i, j = best
+        free = s <= max(side(groups[i]["box"]), side(groups[j]["box"]))
+        if not (s <= max_side or free or len(groups) > max_windows):
+            break
+        groups[i] = {"box": merged(groups[i]["box"], groups[j]["box"]), "comps": groups[i]["comps"] + groups[j]["comps"]}
+        del groups[j]
+    pad = int(mcfg.get("pad_px", 16))
+    return [(square_around(g["box"], raw_shape, pad, min_side), np.isin(lab, g["comps"])) for g in groups]
+
+
+def restrict_tokens(ts, region):
+    """Token set limited to one window's region (per camera, per pair)."""
+    out = {kind: [m & region for m in ts[kind]] for kind in ("core", "recon")}
+    out["pairs"] = {pr: {kind: [m & region for m in v[kind]] for kind in ("core", "recon")}
+                    for pr, v in (ts.get("pairs") or {}).items()}
+    return out
+
+
+def read_gray(path):
+    return cv2.imdecode(np.fromfile(path, np.uint8), cv2.IMREAD_GRAYSCALE).astype(np.float32) / 255.0
+
+
+def composite_windows(work, setup, win_roots, targets):
+    """Round 14: merge the per-window renders of a multi-window variant into one gs/<setup>/<name> directory
+    (pixel taken from the window with the largest alpha; alpha / core alpha = max; valid = any). Meta sums the
+    encode / TTO / render times and Gaussian counts over the windows and lists every window."""
+    names = sorted({p.name for r in win_roots for p in (r / setup).iterdir() if p.is_dir()} if win_roots else set())
+    for name in names:
+        dirs = [r / setup / name for r in win_roots if (r / setup / name / "meta.json").exists()]
+        if not dirs:
+            continue
+        metas = [load_json(d / "meta.json") for d in dirs]
+        out = work / "gs" / setup / name
+        for k in targets:
+            imgs = [imread_rgb(d / f"cam{k}.png").astype(np.float32) for d in dirs]
+            alphas = np.stack([read_gray(d / f"cam{k}_alpha.png") for d in dirs])
+            best = alphas.argmax(0)
+            img = np.take_along_axis(np.stack(imgs), best[None, ..., None], 0)[0]
+            imwrite(out / f"cam{k}.png", img.astype(np.uint8))
+            imwrite(out / f"cam{k}_alpha.png", alphas.max(0))
+            write_mask(out / f"cam{k}_valid.png", np.logical_or.reduce([read_mask(d / f"cam{k}_valid.png") for d in dirs]))
+            cores = [d / f"cam{k}_alpha_core.png" for d in dirs if (d / f"cam{k}_alpha_core.png").exists()]
+            if cores:
+                imwrite(out / f"cam{k}_alpha_core.png", np.stack([read_gray(c) for c in cores]).max(0))
+        m = dict(metas[0])
+        sides = [x["window"][2] for x in metas]
+        m.update(window=metas[int(np.argmax(sides))]["window"], windows=[x["window"] for x in metas],
+                 num_gaussians=sum(x["num_gaussians"] for x in metas),
+                 time_encode_s=sum(x["time_encode_s"] for x in metas),
+                 time_render_per_view_s=sum(x["time_render_per_view_s"] for x in metas),
+                 local_gaussians=[x["local_gaussians"] for x in metas])
+        ttos = [x["tto"] for x in metas if x.get("tto")]
+        if ttos:
+            log = {}
+            for t in ttos:
+                for e in t["log"]:
+                    log.setdefault(e["iter"], []).append(e)
+            merged = []
+            for it in sorted(log):
+                es = log[it]
+                e = {"iter": it, "loss": float(np.mean([x["loss"] for x in es])),
+                     "ctx_psnr": np.mean([x["ctx_psnr"] for x in es], 0).tolist()}
+                if all("time_s" in x for x in es) and len(es) == len(ttos):
+                    e["time_s"] = float(sum(x["time_s"] for x in es))
+                boxes = [x["box"] for x in es if x.get("box")]
+                if boxes:
+                    e["box"] = dict(boxes[0], area_frac=float(np.mean([b["area_frac"] for b in boxes])))
+                merged.append(e)
+            m["tto"] = {"train_gaussians": sum(t["train_gaussians"] for t in ttos), "res": max(t["res"] for t in ttos),
+                        "time_s": sum(t["time_s"] for t in ttos), "log": merged, "windows": len(ttos)}
+        save_json(out / "meta.json", m)
+        print(f"  [{setup}] multi-window {name}: {len(dirs)} windows, sides {sides}")
+
+
 def local_keep(runner, state, tokens, win, size, ctx, targets, gcfg, depth):
     """Per-target (recon, core) keep masks. With per-pair tokens a target between a and b keeps only the
     Gaussians selected by pair (a, b); otherwise every target uses the union over all context cameras."""
@@ -371,7 +467,9 @@ def main():
         # each variant only selects its own local Gaussians -> label "tok", locals "tok<variant>".
         # token crop, per_variant (round 6): one encode per variant with that variant's own window.
         # Other crops use the primary variant's masks for their local Gaussians.
-        jobs = []  # (crop, label, window masks, {local label: (variant, token set)})
+        jobs = []  # (crop, label, window masks, {local label: (variant, token set)}, fixed window, output root)
+        mcfg = gcfg.get("multi_window") or {}
+        win_roots = []
         for crop in crops:
             if crop == "token" and token_sets:
                 live = {}
@@ -391,15 +489,28 @@ def main():
                 wsets = [ts for v, ts in live.items() if not wv or v in wv] or list(live.values())
                 if gcfg.get("token_window", "fixed") == "fixed":
                     union = [np.logical_or.reduce([ts["recon"][i] for ts in wsets]) for i in range(len(ctx))]
-                    jobs.append((crop, "tok", union, {f"tok{v}": (v, ts) for v, ts in sel.items()}))
+                    jobs.append((crop, "tok", union, {f"tok{v}": (v, ts) for v, ts in sel.items()}, None, None))
                 else:
-                    jobs += [(crop, f"tok{v}", ts["recon"], {f"tok{v}": (v, ts)}) for v, ts in sel.items()]
+                    jobs += [(crop, f"tok{v}", ts["recon"], {f"tok{v}": (v, ts)}, None, None) for v, ts in sel.items()]
+                # gs.multi_window (round 14): the same variants again, encoded window by window (one small window
+                # per group of token components, so the 448 px input is barely upsampled); locals "tok<v>_mw",
+                # rendered under gs_win/<v>_w<i>/ and composited into gs/<setup>/ afterwards
+                if mcfg.get("enabled"):
+                    for v, ts in sel.items():
+                        groups = group_windows(ts["recon"], raw_shape, mcfg, gcfg["roi_min_side"])
+                        print(f"[{setup}] token 变体 {v}: {len(groups)} 个编码窗口，边长 {[g[0][2] for g in groups]}")
+                        for i, (w, region) in enumerate(groups):
+                            root = work / "gs_win" / f"{v}_w{i}"
+                            win_roots.append(root)
+                            jobs.append((crop, f"tok{v}_mw{i}_", None, {f"tok{v}_mw": (v, restrict_tokens(ts, region))},
+                                         w, root))
             else:
                 prim = token_sets.get(tcfg.get("primary")) if token_sets else None
-                jobs.append((crop, crop, None, {crop: (tcfg.get("primary"), prim)} if prim else {}))
-        for crop, label, win_masks, locals_ in jobs:
-            win = crop_window(crop, raw_shape, [raws[k] for k in ctx], fg_ctx, gcfg, cfg["chroma"],
-                              win_masks, tcfg.get("crop_pad_px", 0))
+                jobs.append((crop, crop, None, {crop: (tcfg.get("primary"), prim)} if prim else {}, None, None))
+        for crop, label, win_masks, locals_, win_fixed, out_root in jobs:
+            out_root = out_root or work / "gs"
+            win = win_fixed or crop_window(crop, raw_shape, [raws[k] for k in ctx], fg_ctx, gcfg, cfg["chroma"],
+                                           win_masks, tcfg.get("crop_pad_px", 0))
             x0, y0, side = win
             for size in sizes:
                 assert size % 14 == 0, "AnySplat/VGGT 需要 14 的倍数"
@@ -426,7 +537,7 @@ def main():
                                   for k in targets},
                     "c2w_joint": {k: c2w[k].tolist() for k in sorted(c2w)},
                 }
-                save_json(work / "gs" / setup / f"{base}_poses.json", poses)
+                save_json(out_root / setup / f"{base}_poses.json", poses)
                 if shared_t is None:
                     save_json(pose_file, dict(poses, from_variant=base))
                     shared_t = t_pose
@@ -510,7 +621,7 @@ def main():
                             for lab, (tv, kr, kc) in keeps.items():
                                 outputs[f"gs_{lab}{tail}{stage}_local"] = (tv, kr, kc, local_counts[lab])
                             for variant, (tok_variant, kp, kp_core, counts) in outputs.items():
-                                out = work / "gs" / setup / variant
+                                out = out_root / setup / variant
                                 t0 = time.time()
                                 if src.startswith("aligned"):
                                     views = render_aligned(runner, gst, al, src, kp, kw)
@@ -563,7 +674,7 @@ def main():
                                               + ", ".join(f"cam{x['target']} both={x['seen_by_both']:.2f} "
                                                           f"none={x['seen_by_none']:.2f}" for x in st))
                                     views_rp, st, t_rp = rp_cache[(src, geom)]
-                                    out_rp = work / "gs" / setup / variant.replace("_local", f"_rp{geom}_local")
+                                    out_rp = out_root / setup / variant.replace("_local", f"_rp{geom}_local")
                                     for i, k in enumerate(targets):
                                         img, a, valid = views_rp[i]
                                         imwrite(out_rp / f"cam{k}.png", img)
@@ -573,6 +684,7 @@ def main():
                                     save_json(out_rp / "meta.json", dict(meta, reproject=geom, reproject_stats=st,
                                                                          time_render_per_view_s=t_rp))
                 del state
+        composite_windows(work, setup, sorted(set(win_roots)), targets)
 
 
 if __name__ == "__main__":

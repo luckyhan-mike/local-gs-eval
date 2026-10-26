@@ -185,7 +185,9 @@ def main():
             print(f"[{setup}] 跳过第一轮的旧 GS 目录（无渲染变体信息）: {stale}")
             gs_vars = [gv for gv in gs_vars if gv not in stale]
             gs_meta = {gv: gs_meta[gv] for gv in gs_vars}
-        tto_info.update({setup: m["tto"] for m in gs_meta.values() if m.get("tto")})
+        main_tok = f"gs_tok{ecfg.get('tto_main_variant', 'rife')}"  # one encode per variant since round 14
+        tto_info.update({setup: m["tto"] for gv, m in gs_meta.items() if m.get("tto")
+                         and (gv.startswith(f"{main_tok}{m.get('size')}_") or not gv.startswith("gs_tok"))})
         for gv, m in gs_meta.items():
             pd = m.get("pose_diag") or m
             gs_rows.append([setup, gv, m.get("pose_source", "vggt"), m["window"][2], m["render_res"], m["render"]["mode"],

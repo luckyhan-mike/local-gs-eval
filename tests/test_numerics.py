@@ -464,6 +464,99 @@ class NumericsTests(unittest.TestCase):
         self.assertFalse(fg[5, 5])
         self.assertTrue(fg[60, 45] and fg[60, 115])
 
+    def test_multi_window_grouping_partitions_tokens(self):
+        from scripts.run_anysplat import group_windows, restrict_tokens
+        h, w = 1296, 2304
+        a, b = np.zeros((h, w), bool), np.zeros((h, w), bool)
+        a[300:400, 300:420] = True        # face, cam a
+        b[310:410, 380:500] = True        # same face shifted in cam b: overlaps -> one component
+        a[600:640, 520:560] = True        # hand 200 px below: merged (square stays within 640)
+        b[900:1000, 1900:2000] = True     # tripod far right: its own window
+        groups = group_windows([a, b], (h, w), {"max_side": 640, "max_windows": 4, "pad_px": 16}, 448)
+        self.assertEqual(len(groups), 2)
+        for (x0, y0, side), region in groups:
+            self.assertEqual(side, 448)   # min side: no window above 448 here, so no upsampling at all
+            ys, xs = np.nonzero(region & (a | b))
+            self.assertTrue(x0 <= xs.min() and xs.max() < x0 + side and y0 <= ys.min() and ys.max() < y0 + side)
+        regions = [r for _, r in groups]
+        self.assertFalse((regions[0] & regions[1]).any())
+        np.testing.assert_array_equal(regions[0] | regions[1], a | b)
+        one = group_windows([a, b], (h, w), {"max_side": 640, "max_windows": 1}, 448)
+        self.assertEqual(len(one), 1)
+        ts = {"core": [a, b], "recon": [a, b], "pairs": {(0, 3): {"core": [a, b], "recon": [a, b]}}}
+        r = restrict_tokens(ts, regions[0])
+        self.assertEqual(int(r["recon"][0].sum() + r["recon"][1].sum()), int((regions[0] & a).sum() + (regions[0] & b).sum()))
+        self.assertTrue(np.array_equal(r["pairs"][(0, 3)]["core"][1], b & regions[0]))
+
+    def test_multi_window_composite_and_external_tokens(self):
+        import tempfile
+        from pathlib import Path
+        import cv2
+        from lgs.common import imread_rgb, imwrite, load_json, save_json, write_mask
+        from scripts.run_anysplat import composite_windows, read_gray
+        from scripts.detect_tokens import external_mask
+        with tempfile.TemporaryDirectory() as d:
+            d = Path(d)
+            roots = [d / "gs_win" / f"v_w{i}" for i in range(2)]
+            for i, r in enumerate(roots):
+                out = r / "s" / "gs_tokv_mw448_x_local"
+                img = np.zeros((20, 30, 3), np.uint8); img[:] = 100 * (i + 1)
+                al = np.zeros((20, 30), np.float32); al[:, 15 * i:15 * i + 15] = 1.0
+                imwrite(out / "cam1.png", img); imwrite(out / "cam1_alpha.png", al); imwrite(out / "cam1_alpha_core.png", al)
+                write_mask(out / "cam1_valid.png", al > 0)
+                save_json(out / "meta.json", {"window": [0, 0, 448 + 100 * i], "num_gaussians": 10, "time_encode_s": 0.3,
+                                              "time_render_per_view_s": 0.01, "local_gaussians": {}, "render": {},
+                                              "tto": {"train_gaussians": 5, "res": 448, "time_s": 1.0,
+                                                      "log": [{"iter": 1, "loss": 0.1, "ctx_psnr": [20.0, 22.0]},
+                                                              {"iter": 25, "loss": 0.05, "ctx_psnr": [24.0, 26.0],
+                                                               "time_s": 0.5 + i}]}})
+            composite_windows(d, "s", roots, [1])
+            out = d / "gs" / "s" / "gs_tokv_mw448_x_local"
+            img = imread_rgb(out / "cam1.png")
+            self.assertEqual(int(img[5, 5, 0]), 100)
+            self.assertEqual(int(img[5, 25, 0]), 200)
+            self.assertTrue(np.allclose(read_gray(out / "cam1_alpha.png"), 1.0))
+            m = load_json(out / "meta.json")
+            self.assertEqual(m["window"][2], 548)
+            self.assertEqual(len(m["windows"]), 2)
+            self.assertAlmostEqual(m["time_encode_s"], 0.6)
+            self.assertAlmostEqual([e for e in m["tto"]["log"] if e["iter"] == 25][0]["time_s"], 2.0)
+            # external token mask: raw frame, per pair, path pattern with {shot}, warped by the raw->aligned H
+            mk = np.zeros((40, 60), bool); mk[10:20, 30:40] = True
+            write_mask(d / "tok" / "changjing1_shot_0021" / "cnn" / "pair0-3" / "cam3.png", mk)
+            H = np.array([[1, 0, -5], [0, 1, -2], [0, 0, 1]], np.float64)
+            got = external_mask({"shot": "changjing1/shot_0021"}, str(d / "tok" / "{shot}" / "cnn"), 0, 3, 3, H, (40, 60))
+            self.assertTrue(got[8:18, 25:35].all() and got.sum() == mk.sum())
+
+    def test_tto_periodic_covariance_cap_holds_at_checkpoints(self):
+        import torch
+        from types import SimpleNamespace
+        from lgs.tto import optimize
+        n = 4
+        s = torch.full((n, 3), 0.05)
+        cov = torch.diag_embed(s ** 2)
+        means = torch.zeros(1, n, 3); means[0, :, 2] = 3.0
+        g = SimpleNamespace(means=means, covariances=cov[None], opacities=torch.full((1, n), 0.5),
+                            rotations=torch.zeros(1, n, 4), scales=s[None], harmonics=torch.full((1, n, 3, 1), 0.5))
+
+        class GrowRunner:
+            device = "cpu"
+            model = SimpleNamespace(decoder=SimpleNamespace(background_color=torch.zeros(3)))
+
+            def rasterization(self, means, quats, scales, op, feat, viewmats, Ks, w, h, covars=None, **kw):
+                v = torch.sigmoid(-covars.diagonal(dim1=-2, dim2=-1).sum(-1).mean() * 100)
+                return v.expand(len(viewmats), h, w, 3), None, None
+
+        state = {"gaussians": g, "ctx_c2w": np.repeat(np.eye(4)[None], 2, 0), "ctx_intr": np.repeat(np.eye(3)[None], 2, 0)}
+        state["ctx_c2w"][1, 0, 3] = 1.0
+        snaps, _ = optimize(GrowRunner(), state, np.zeros((2, 8, 8, 3), np.float32), 8, [7, 37], np.ones(n, bool),
+                            {"lr": {"cov": 0.5}, "ssim_weight": 0.0, "max_cov_scale": 1.5, "cov_every": 10})
+        for it in (7, 37):
+            ratio = snaps[it].covariances[0].diagonal(dim1=-2, dim2=-1) / cov.diagonal(dim1=-2, dim2=-1)
+            self.assertLessEqual(float(ratio.max()), 1.5 ** 2 * 1.001)
+        self.assertGreater(float((snaps[37].covariances[0].diagonal(dim1=-2, dim2=-1) / cov.diagonal(dim1=-2, dim2=-1)).max()),
+                           1.5 ** 2 * 0.9)  # the pull reached the cap
+
 
 if __name__ == '__main__':
     unittest.main()

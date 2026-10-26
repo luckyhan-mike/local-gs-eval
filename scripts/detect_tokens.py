@@ -18,6 +18,8 @@ Every entry of `tokens.variants` recombines these signals with its own threshold
          pixel, i.e. a depth jump where the flow actually breaks) | off
   core   (fail | depth) dilated by core_dilate_px      -> region pasted back from GS
   recon  core dilated by recon_margin_px                -> region whose Gaussians are kept
+  external   (round 14) instead of the RIFE signals, a per-pair raw-frame mask computed elsewhere (e.g. the
+         round-7 Cn_wide region from tools/export_cnw_tokens.py) is the fail map; core / recon as below
   pair_gate  if the pair's core covers less than this fraction of the foreground (mean over its two
          cameras) the pair does not trigger GS at all: its views stay pure flow (small baselines)
 Round 5 showed GS only helps where the flow really fails (perfect detector: +4.4 dB fg on cam3) and
@@ -85,6 +87,16 @@ def drop_small(m, min_px):
     return keep[lab]
 
 
+def external_mask(cfg, pattern, a, b, k, h_raw2al, shape):
+    """Round 14: a GS-region mask computed outside this repo (e.g. tools/export_cnw_tokens.py), stored per pair
+    on the raw frame as <pattern>/pair{a}-{b}/cam{k}.png; pattern may contain {shot} (scene_shot of this work dir)
+    and is relative to the repository root. Warped into the aligned frame like the raw images."""
+    root = Path(pattern.format(shot=cfg.get("shot", "").replace("/", "_")))
+    root = root if root.is_absolute() else Path(__file__).resolve().parents[1] / root
+    m = read_mask(root / f"pair{a}-{b}" / f"cam{k}.png")
+    return cv2.warpPerspective(m.astype(np.uint8), h_raw2al, shape[::-1], flags=cv2.INTER_NEAREST) > 0
+
+
 def variant_params(tcfg, name):
     p = {"use_dis": False, "rife_warp": 0.20, "rife_col": 6.0, "depth": "near_fail", "near_fail_px": 12,
          "min_cc_px": 150, "depth_thresh": tcfg["depth_thresh"], "pair_gate": 0.0}
@@ -148,6 +160,13 @@ def main():
                 edge = (s["g_disp"] > p["depth_thresh"]) & near_mid
                 pm = {}
                 for src, ch in ((a, slice(0, 2)), (b, slice(2, 4))):
+                    if p.get("external"):  # round 14: region from another detector, used as given (no fg limit)
+                        fail = external_mask(cfg, p["external"], a, b, src, hs[src], shape)
+                        depth = np.zeros(shape, bool)
+                        core = dilate(fail, tcfg["core_dilate_px"])
+                        pm[src] = {"fail": fail, "depth": depth, "core": core,
+                                   "recon": dilate(core, tcfg["recon_margin_px"])}
+                        continue
                     fail = splat(bad, flow[..., ch], shape) | (occl[src] if p["use_dis"] else False)
                     fail = drop_small(fail & near[src], p["min_cc_px"])
                     depth = splat(edge, flow[..., ch], shape) & near[src]

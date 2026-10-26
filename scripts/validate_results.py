@@ -47,12 +47,15 @@ def main():
                  for src in gcfg.get("pose_sources", ["vggt"])]
         variants = []
         for crop in gcfg["crops"]:
-            if crop == "token" and fixed:  # one encode: full render gs_tok*, one local render per token variant
+            if crop == "token" and tok_vars:
+                # fixed: one encode, full render gs_tok*; per_variant: one encode (and full render) per variant;
+                # gs.multi_window (round 14): composited local renders gs_tok<v>_mw*
                 if gcfg.get("render_full", True):
-                    variants += [f"gs_tok{t}" for t in tails]
-                variants += [f"gs_{lab}{t}_local" for lab in labels for t in tails]
+                    variants += [f"gs_tok{t}" for t in tails] if fixed else [f"gs_{lab}{t}" for lab in labels for t in tails]
+                labs = labels + ([f"{lab}_mw" for lab in labels] if (gcfg.get("multi_window") or {}).get("enabled") else [])
+                variants += [f"gs_{lab}{t}_local" for lab in labs for t in tails]
                 for it in (gcfg.get("tto") or {}).get("checkpoints") or []:  # TTO checkpoint renders
-                    variants += [f"gs_{lab}{t}_tto{it}_local" for lab in labels for t in tails]
+                    variants += [f"gs_{lab}{t}_tto{it}_local" for lab in labs for t in tails]
             else:
                 full = [f"gs_{lab}{t}" for lab in (labels if crop == "token" else [crop]) for t in tails]
                 variants += full + ([v + "_local" for v in full] if tok_root.exists() else [])
