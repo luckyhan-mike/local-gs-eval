@@ -582,6 +582,70 @@ class NumericsTests(unittest.TestCase):
         self.assertTrue(np.allclose(rgb[12:18, 50:60], 0.2, atol=0.05))   # wall
         self.assertGreater(float(alpha[12:18, 27:33].min()), 0.9)
 
+    def _two_views(self):
+        """Wall (displacement a->b +4 px) behind a near square (-10 px), as in the round-15 test, raw (b derived)."""
+        h, w = 40, 80
+        img_a = np.full((h, w, 3), 0.2, np.float32); img_a[10:20, 30:40] = 0.9
+        img_b = np.full((h, w, 3), 0.2, np.float32); img_b[10:20, 20:30] = 0.9
+        ga = np.zeros((2, h, w), np.float32); ga[0] = 4.0; ga[0, 10:20, 30:40] = -10.0
+        gb = np.zeros((2, h, w), np.float32); gb[0] = -4.0; gb[0, 10:20, 20:30] = 10.0
+        gb[0, 10:20, 30:34] = np.nan
+        fg = np.zeros((h, w), bool); fg[10:20, 30:40] = True
+        return img_a, img_b, ga, gb, fg
+
+    def test_round16_prep_side_numpy_equals_torch(self):
+        from lgs.pixgs import prep_side, prep_side_torch, depth_sign
+        _, _, ga, gb, fg = self._two_views()
+        sign = depth_sign(ga[0], fg, np.isfinite(ga[0]))
+        for g, s in ((ga, sign), (gb, -sign)):
+            f_np, ok_np = prep_side(g, s)
+            f_t, ok_t = prep_side_torch(g, s, "cpu")
+            self.assertTrue(np.array_equal(ok_np, ok_t.numpy()))
+            self.assertTrue(np.allclose(np.nan_to_num(f_np, nan=-99), np.nan_to_num(f_t.numpy(), nan=-99), atol=1e-5))
+        f, ok = prep_side(gb, -sign)
+        self.assertFalse(ok[10:20, 30:34].any())                       # missing pixels are LR-failed ...
+        self.assertTrue(np.allclose(f[0, 10:20, 30:34], -4.0))         # ... and take the wall (background) displacement
+        _, ok_a = prep_side(ga, sign)
+        self.assertFalse(ok_a[10:20, 16:26].any())                     # wall of a landing under the square in b (x+4 in 20..29)
+        self.assertTrue(ok_a[10:20, 26:30].all())                      # wall of a landing at 30..33 stays visible in b
+
+    def test_round16_pix2_and_p3h_render_square_and_paste_region(self):
+        from lgs.pixgs import PixSet2, depth_sign, make_set2, prep_side, render_view2, gate_by_flow
+        from lgs import stereo_synth
+        img_a, img_b, ga, gb, fg = self._two_views()
+        h, w = fg.shape
+        sign = depth_sign(ga[0], fg, np.isfinite(ga[0]))
+        fa, oka = prep_side(ga, sign); fb, okb = prep_side(gb, -sign)
+        need = np.ones((h, w), bool)
+        core_a = np.zeros((h, w), bool); core_a[8:22, 28:42] = True
+        core_b = np.zeros((h, w), bool); core_b[8:22, 18:32] = True
+        t = 0.5
+        sets = [make_set2(img_a, fa, oka, core_a, need, t, sign, 0.5, 3.0, 1.0),
+                make_set2(img_b, fb, okb, core_b, need, 1 - t, -sign, 0.5, 3.0, 1.0)]
+        rgb, alpha, core, backend = render_view2(sets, t, (h, w), {"depth_tol_px": 3.0}, backend="torch")
+        self.assertEqual(backend, "torch")
+        self.assertTrue(np.allclose(rgb[12:18, 27:33], 0.9, atol=0.05))    # square at x + t*g = 25..35
+        self.assertTrue(np.allclose(rgb[12:18, 50:60], 0.2, atol=0.05))
+        self.assertGreater(float(core[12:18, 27:33].min()), 0.9)           # paste region follows the square
+        self.assertLess(float(core[12:18, 50:60].max()), 0.1)
+        # build-once set gives the same primitives as make_set2 at any t
+        ps = PixSet2(img_a, fa, oka, core_a, need, sign, 0.5, 3.0, 1.0, "cpu")
+        for tt in (0.25, 0.7):
+            pos, col, key, sig = ps.at(tt)
+            ref = make_set2(img_a, fa, oka, core_a, need, tt, sign, 0.5, 3.0, 1.0)
+            for x, y in zip((pos, col, key, sig), ref):
+                self.assertTrue(np.allclose(x.numpy(), y, atol=1e-5))
+        P = stereo_synth.prepare(img_a, img_b, fa, fb, oka, okb, core_a, core_b, need, need, sign)
+        rgb2, alpha2, core2 = stereo_synth.render(P, t)
+        self.assertTrue(np.allclose(rgb2[12:18, 27:33], 0.9, atol=0.05))
+        self.assertTrue(np.allclose(rgb2[12:18, 50:60], 0.2, atol=0.05))
+        self.assertEqual(float(alpha2.min()), 1.0)                         # covered or filled everywhere here
+        self.assertGreater(float(core2[12:18, 27:33].min()), 0.9)
+        # gate: identical flow -> nothing pasted; a flow that misses the square -> the square is pasted
+        self.assertEqual(float(gate_by_flow(rgb2, rgb2, core2, 0.1, 1, 2).max()), 0.0)
+        flow = np.full_like(rgb2, 0.2)
+        self.assertGreater(float(gate_by_flow(rgb2, flow, core2, 0.1, 1, 2)[12:18, 27:33].min()), 0.9)
+
 
 if __name__ == '__main__':
     unittest.main()

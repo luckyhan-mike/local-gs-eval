@@ -1,0 +1,35 @@
+{
+ "0-3": {
+  "time_stereo_s": 0.36082810000516474,
+  "box": [
+   0,
+   269,
+   1179,
+   1088
+  ],
+  "valid_a": 454093,
+  "valid_b": 353857,
+  "median_dx_a": 21.0
+ },
+ "3-5": {
+  "time_stereo_s": 0.3312048999941908,
+  "box": [
+   0,
+   422,
+   1203,
+   1088
+  ],
+  "valid_a": 327638,
+  "valid_b": 267037,
+  "median_dx_a": 13.25
+ },
+ "shot": "changjing1/shot_0025",
+ "cams": [
+  0,
+  3,
+  5
+ ],
+ "band_px": 72,
+ "gpu": "NVIDIA GeForce RTX 3090",
+ "config": "pregs_exp P3 c_s25_it8 (FoundationStereo ViT-S, scale 0.25, 8 iters, one direction)"
+}

@@ -14,7 +14,71 @@
 
 ---
 
-## 第十五轮（当前）：视差空间逐像素高斯（pixgs 变体）
+## 第十六轮 a（当前）：修补方法对比（立体合成 p3h / 逐像素高斯修复版 pix2 × 三种对应来源 × 贴回门控）+ 密集视点计时
+
+| 机器 | 标签 | 跑什么 | 结果上传到 |
+|---|---|---|---|
+| linux-4090 | `linux-4090-round16a-p3h-pix2` | 自己那 23 组（`--host linux-4090`）补跑新变体 + 评估；之后跑密集视点计时 | `experiment/linux-4090-round16a-p3h-pix2-<日期>` |
+| linux-3090 | `linux-3090-round16a-p3h-pix2` | 另外 23 组（`--host linux-3090`）补跑新变体 + 评估；计时可选 | `experiment/linux-3090-round16a-p3h-pix2-<日期>` |
+
+**两台机器跑同一套变体、各自一半场景**（分组同第十四、十五轮），合起来才是 46 组 / 138 个目标视点。每台机器工作目录里已有自己那 23 组第十五轮的结果（预处理、token、光流、AnySplat、pixgs），本轮**不重跑 AnySplat**，只补新步骤。
+
+**本轮回答的问题**：
+1. 第十五轮 pixgs 的 LPIPS 比光流差（深度边缘横条纹、贴回区过大）。pregs_exp P3 已查明条纹来源并修好；把这些修法搬进逐像素高斯后（`pix2`）能否追上光流？
+2. 不用高斯、直接用立体对应做前向合成（P3 方案 H，`p3h`）是不是一样好？如果 `pix2` 赢不了 `p3h`，GS 这一步就要重新考虑。
+3. token 区的对应关系来源：FoundationStereo-L（`fsl`，每对约 0.4 s）、FoundationStereo-S（`fss`，约 0.3 s）、RIFE t=0.5 视点的光流（`flw`，部署时几乎免费）。
+4. 不用真值的贴回门控（`_g`）：只在修补结果与光流结果明显不同处贴，能否减少"光流本来对、贴了反而变差"的损失。
+
+**变体**（标签 `cnw_cnn_<名字>`，token 固定为第十五轮的 `cnw_cnn`；汇总表里的名字）：
+
+| 名字 | 方法 | 对应来源 |
+|---|---|---|
+| `p3h_fsl` / `p3h_fsl_g` | P3 立体合成（`lgs/stereo_synth.py`）：双侧 2×2 双线性前向投影，共用 z-buffer，按 (1−t)、t ×（0.05 + 左右一致比例）混合，空洞 push-pull 填补 | `data/disp_fs`（第十五轮同一份） |
+| `p3h_fss` / `p3h_fss_g` | 同上 | `data/disp_fss`（新，FS-S） |
+| `p3h_flw` | 同上 | `data/disp_flw`（新，光流） |
+| `pix2_fsl` / `pix2_fsl_g` | 逐像素高斯修复版（`lgs/pixgs.py` `render_view2`）：左右不一致 / 缺失像素按 P3 规则沿行补位移（两侧一致时插值，否则取背景侧）；深度边缘（\|∂g_x/∂x\| > 1）不沿 x 拉长；两侧按左右一致比例加权；每侧一次渲染（core 作为附加通道）；空洞不填，贴回时退回光流 | `data/disp_fs` |
+| `pix2_fss` / `pix2_fss_g` | 同上 | `data/disp_fss` |
+| `pix2_flw` | 同上 | `data/disp_flw` |
+
+`_g` = 同一渲染，只在"修补结果与光流结果平均 \|RGB\| 差（模糊 3 px）> 0.10"处（再膨胀 8 px）保留贴回区；光流来源的位移本来就跟光流一致，不做门控。第十五轮的 `cnw_cnn_pix` / `cnw_f5_pix` 与 AnySplat 各变体（含 `cnw_cnn_mw` TTO 100 步）照常出现在汇总表里作参照（不重算）。
+
+**跑法**：
+
+```bash
+# 4090：HOST=linux-4090；3090：HOST=linux-3090
+cd $DATA_ROOT/local-gs-eval && git fetch --tags -f && git checkout ${HOST}-round16a-p3h-pix2
+ls data/disp_fs data/disp_fss data/disp_flw | grep -c shot   # 应为 138（每种 46 组）
+python -m unittest discover -s tests -v                       # 24 项
+export HF_HUB_OFFLINE=1 PYTHONUNBUFFERED=1
+```
+
+- **工作目录必须是第十五轮那份**（里面有第十五轮的 token、光流和 AnySplat 结果）。仓库默认 `dataset6.work_root: work/dataset6`；如果第十五轮改过输出目录（例如 4090 用的是 `work/dataset6_round15_pixgs`），就像上次一样复制一份配置、只把 `work_root` 改成那个目录，下面命令里的 `--config` 换成那份配置。
+- 1）补跑新变体 + 评估 + 验证（每组约 2–4 分钟，主要是评估；23 组约 1–1.5 小时）：
+
+  ```bash
+  python scripts/run_scenes.py --config configs/dataset6_lean.yaml --host $HOST --steps pixgs evaluate validate 2>&1 | tee work/dataset6_r16a.log
+  ```
+
+- 2）密集视点计时（**4090 必跑，3090 可选**；GPU 上不能有别的任务；约 10–15 分钟）。取本机前 6 组场景，每对输入相机生成 41 和 60 个视点，分别计 RIFE、修补渲染（pix2 / p3h）、贴回的耗时：
+
+  ```bash
+  python scripts/bench_dense.py --config configs/dataset6_lean.yaml --host $HOST --views 41 60 2>&1 | tee work/bench_dense.log
+  ```
+
+  输出 `<work_root>/bench_dense_${HOST}.md` 和 `.json`。
+
+上传：`summary_all.md`、各组 `eval/`、`logs/`、`gs/*/gs_tokcnw_cnn_{p3h,pix2}*/meta.json`（渲染图不用传）、`bench_dense_${HOST}.md/.json`、`work/dataset6_r16a.log`、`work/bench_dense.log`、单元测试日志，传到上表的分支。
+
+**判断标准**：
+1. 汇总表"全部场景合计"与"第七轮试点场景合计"中，`cnw_cnn_pix2_*`、`cnw_cnn_p3h_*` 对比纯光流、`cnw_cnn_pix`（第十五轮）和 `cnw_cnn_mw` TTO 100 步：fg PSNR / LPIPS、不差目标数（直接贴回和 oracle 都看）。
+2. 若 `pix2` 不如 `p3h` → 后面改用立体合成，GS 降为可选；若 `pix2` 不差于 `p3h`、时间相近 → 保留 GS 路线。
+3. `flw` 只有在 token 区画质接近 `fsl` 时才值得用；`fss` 看比 `fsl` 差多少。
+4. `_g` 是否让直接贴回的"不差目标数"上升而 oracle 不降。
+5. 计时：每视点"修补渲染 + 贴回"与 RIFE 本身的比例；N=41/60 时整组场景的总时间。
+
+**本机检查**（Windows RTX 3090，gsplat 未安装，pix2 用 torch 渲染）：changjing1/shot_0021 上从 pixgs 到评估跑通；同一场景光流几乎没有失败，数字只说明流程通了（fg：纯光流 22.73 / 0.0689，pix2_fsl oracle 22.72 / 0.0734，第十五轮 pix oracle 22.82 / 0.0711）。密集视点计时（N=41/对，82 个视点）：pix2 每视点修补 6.9 ms、贴回 1.0 ms，RIFE 29 ms；高斯每对只建一次（0.24 s / 2 对）。对应关系导出（Windows RTX 3090，每组 2 对的中位数）：FS-L 0.80 s，FS-S 0.61 s（比 P3 报告的 0.19 s/对慢，含校正变换），光流 0.17 s（含一次 RIFE 推理，部署时这张视点本来就要生成）。
+
+## 第十五轮：视差空间逐像素高斯（pixgs 变体）
 
 | 机器 | 标签 | 跑什么 | 结果上传到 |
 |---|---|---|---|

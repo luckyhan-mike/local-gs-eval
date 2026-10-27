@@ -60,6 +60,12 @@ def main():
                 if pix.get("enabled"):  # round 15: run_pixgs.py
                     variants += [f"gs_tok{v}_pix{gcfg['sizes'][0]}_pix_al_local" for v in pix.get("variants", [])
                                  if v in tok_vars]
+                    gated = set((pix.get("gate") or {}).get("runs", []))
+                    for r in pix.get("runs", []):  # round 16: <token>_<run>[_g]
+                        for tok in pix.get("run_tokens", []):
+                            if tok in tok_vars:
+                                variants += [f"gs_tok{tok}_{r['name']}{s}{gcfg['sizes'][0]}_{r['method']}_al_local"
+                                             for s in ([""] + (["_g"] if r["name"] in gated else []))]
             else:
                 full = [f"gs_{lab}{t}" for lab in (labels if crop == "token" else [crop]) for t in tails]
                 variants += full + ([v + "_local" for v in full] if tok_root.exists() else [])

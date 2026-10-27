@@ -1,0 +1,35 @@
+{
+ "0-3": {
+  "time_stereo_s": 0.07354140002280474,
+  "box": [
+   0,
+   239,
+   1242,
+   1088
+  ],
+  "valid_a": 358181,
+  "valid_b": 332012,
+  "median_dx_a": 25.25
+ },
+ "3-5": {
+  "time_stereo_s": 0.06959109997842461,
+  "box": [
+   0,
+   361,
+   1168,
+   1088
+  ],
+  "valid_a": 196515,
+  "valid_b": 196883,
+  "median_dx_a": 9.75
+ },
+ "shot": "changjing1/shot_0014",
+ "cams": [
+  0,
+  3,
+  5
+ ],
+ "band_px": 72,
+ "gpu": "NVIDIA GeForce RTX 3090",
+ "config": "RIFE flow of the t=0.5 view, F_t->1 - F_t->0 splatted to each source (rt_token_exp R1 reuse-m); time includes the RIFE run, which deployment gets for free"
+}

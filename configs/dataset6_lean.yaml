@@ -202,6 +202,22 @@ gs:
     eps2d: 0.3                          # gsplat 二维抗锯齿膨胀
     fill_px: 96                         # 某一侧看不到的像素（如 b 中被遮住的墙）沿行取背景侧最近的有效位移，最远 96 px
     depth_tol_px: 3.0                   # 两侧高斯前后差小于 3 px 位移时按 (1-t) / t 混合，否则取更近的一侧
+    skip_existing: true                 # 第十六轮：第十五轮的 *_pix 结果已在工作目录里时不重算
+    # ---- 第十六轮：修补方法 × 对应来源（标签 <token>_<name>，目录 gs_tok<标签>448_<method>_al_local）----
+    run_tokens: [cnw_cnn]               # 第十六轮 a 只用 cnw_cnn（第十五轮主 token），换 token 放到第十六轮 b
+    edge_px: 1.0                        # pix2：|dg_x/dx| > 1 px/px（深度边缘）处不沿 x 拉长，裂缝留给另一侧或退回光流
+    runs:
+      - {name: p3h_fsl,  method: p3h,  disp: "data/disp_fs/{shot}"}    # P3 立体合成（无高斯），FoundationStereo-L（rec_pp）
+      - {name: p3h_fss,  method: p3h,  disp: "data/disp_fss/{shot}"}   # 同上，FoundationStereo-S（P3 c_s25_it8）
+      - {name: p3h_flw,  method: p3h,  disp: "data/disp_flw/{shot}"}   # 同上，RIFE t=0.5 视点的光流（R1 做法，部署时几乎不花时间）
+      - {name: pix2_fsl, method: pix2, disp: "data/disp_fs/{shot}"}    # 逐像素高斯修复版
+      - {name: pix2_fss, method: pix2, disp: "data/disp_fss/{shot}"}
+      - {name: pix2_flw, method: pix2, disp: "data/disp_flw/{shot}"}
+    gate:                               # 不用真值的贴回门控：只在渲染结果与光流结果明显不同处贴（<标签>_g）；光流来源的位移本来就跟光流一致，不做门控
+      runs: [p3h_fsl, p3h_fss, pix2_fsl, pix2_fss]
+      thr: 0.10                         # 平均 |RGB| 差（0–1），高斯模糊 3 px 后的阈值（0.05 在本机一组场景上只去掉 16–36% 的 core，太松）
+      blur_px: 3
+      dilate_px: 8
   token_window: per_variant             # 第十四轮：各变体的区域差别大，各用自己的窗口；fixed：所有 token 变体共用一次编码（窗口 = 各变体重建区并集），变体只决定选哪些高斯；per_variant：第六轮做法（每个变体按自己的窗口各编码一次，窗口小时 GS 变差）
   reproject:                            # 第九轮：几何来自 3D、纹理取自输入原图（lgs/reproject.py），与 GS 颜色贴回用同一 token 贴回区
     geometries: []                      # 第九轮负面结果（几何不够准，纹理错位），本轮关闭；[gs, vggt] 可恢复
