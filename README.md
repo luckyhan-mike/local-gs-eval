@@ -14,7 +14,48 @@
 
 ---
 
-## 第十六轮 a（当前）：修补方法对比（立体合成 p3h / 逐像素高斯修复版 pix2 × 三种对应来源 × 贴回门控）+ 密集视点计时
+## 第十七轮（当前）：两侧重建区互投补齐 + 融合 + 联合优化（pix3），只跑选定方向
+
+| 机器 | 标签 | 跑什么 | 结果上传到 |
+|---|---|---|---|
+| linux-4090 | `linux-4090-round17-pix3` | 自己那 23 组：补跑 pixgs、评估、验证；然后跑密集视点计时 | `experiment/linux-4090-round17-pix3-<日期>` |
+| linux-3090 | `linux-3090-round17-pix3` | 另外 23 组，内容相同；计时也跑（两台硬件都要数字） | `experiment/linux-3090-round17-pix3-<日期>` |
+
+**本轮只看已经选定的方向**：对应关系固定为 FoundationStereo-L（`data/disp_fs`），token 固定为 `cnw_cnn`。第十六轮淘汰的 p3h（立体合成）、FS-S / 光流来源、第十五轮 pix 都不再计算，AnySplat 不再运行。评估只评下表这些变体（`eval.only_gs`），区域只算 fg / 失败区 / 风险区 / 其余，外加按可见性拆开的失败区（`eval.regions`），汇总表开头是一张精简的第十七轮表。
+
+| 汇总里的名字 | 做法 |
+|---|---|
+| `cnw_cnn_pix2_fsl` / `_g` | 第十六轮基线：A、B 两侧各一份逐像素高斯，不融合、不优化（`_g` = 不用真值的贴回门控） |
+| `cnw_cnn_pix3n_fsl` / `_g` | **新**（`lgs/pixfuse.py`）：① 两侧重建区互投补齐：A 标了、B 没标的不可靠区域，沿立体对应投到 B 上一起送进来，反之亦然；② 融合：两侧都看得到（左右一致）的像素只生成一个高斯，颜色取两侧平均；只有一侧看得到的像素保留单份，深度用背景侧位移补；③ 每视点一次渲染 |
+| `cnw_cnn_pix3_fsl` | 同 pix3n，再在两个真实视角上联合优化 100 步（渲染到 A 的位置比 A 原图、渲染到 B 的位置比 B 原图，只在重建区内；优化颜色、不透明度、大小，以及两侧可见高斯的视差偏移；只有一侧可见的高斯不改深度） |
+| `cnw_cnn_mw (TTO 100)` | 参照：AnySplat 多窗口 + TTO 100 步（第十六轮失败区画质最好），只评估、不重跑 |
+
+失败区按可见性拆开（来自 pix3n 渲染时每个像素的来源）：**两侧可见**（联合优化能约束的部分）和**单侧可见**（深度只能靠背景先验的部分）。
+
+**跑法**（工作目录用第十六轮那份，里面有 token、光流和 pix2 的结果；4090 若改过 `work_root`，同上次一样复制配置改 `work_root`）：
+
+```bash
+# 4090：HOST=linux-4090；3090：HOST=linux-3090
+cd $DATA_ROOT/local-gs-eval && git fetch --tags -f && git checkout ${HOST}-round17-pix3
+python -m unittest discover -s tests -v                       # 25 项
+export HF_HUB_OFFLINE=1 PYTHONUNBUFFERED=1
+python scripts/run_scenes.py --config configs/dataset6_lean.yaml --host $HOST --steps pixgs evaluate validate 2>&1 | tee work/dataset6_r17.log
+python scripts/bench_dense.py --config configs/dataset6_lean.yaml --host $HOST --views 41 60 2>&1 | tee work/bench_dense_r17.log
+```
+
+第一条每组约 1–2 分钟（评估只剩 6 个变体，比上轮快），23 组约 40–60 分钟；计时约 15 分钟（GPU 上不能有别的任务），比较 pix2 / pix3n / pix3 三种：每对一次的建立和联合优化时间、每视点 RIFE / 修补渲染 / 贴回。
+
+上传：`summary_all.md`、各组 `eval/`、`logs/`、`gs/*/gs_tokcnw_cnn_{pix2,pix3n,pix3}*/meta.json`、`bench_dense_${HOST}.md/.json`、两个 `.log`、单元测试日志。
+
+**判断标准**：
+1. `pix3n` 对比 `pix2`：互投补齐 + 融合是否让失败区（尤其"两侧可见"）更好，贴回后 fg 是否不变差。
+2. `pix3` 对比 `pix3n`：联合优化是否值得它的时间。**本机提醒**：本机没有 gsplat，优化用的是简化渲染器（不含不透明度和大小），在一组场景上优化反而让 LPIPS 变差（oracle fg 0.0735 → 0.0788，只优化颜色或只优化视差也都变差）；Linux 上用 gsplat 是第一次跑，以 46 组结果为准。
+3. 失败区"单侧可见"部分各方法都比光流差多少：这部分是下一步（开机背景平面给深度、第三台相机）要解决的。
+4. 速度：`pix3n` 每对建立约 0.3 s、每视点渲染与 pix2 相当；`pix3` 多出的联合优化时间。
+
+**本机检查**（Windows RTX 3090，torch 渲染器，changjing1/shot_0021，这组光流几乎没失败，只说明流程通了）：失败区·两侧可见 纯光流 13.98 / 0.0282，pix2 14.24 / 0.0277，**pix3n 14.52 / 0.0272**，pix3 14.23 / 0.0342；失败区·单侧可见 纯光流 17.78 / 0.0145，各方法 16.7–16.8 / 0.016（都比光流差）。计时（N=41/对）：pix3n 建立 0.57 s / 2 对，每视点渲染 5.8 ms；pix3 联合优化 3.6 s / 2 对（torch 渲染器）。
+
+## 第十六轮 a：修补方法对比（立体合成 p3h / 逐像素高斯修复版 pix2 × 三种对应来源 × 贴回门控）+ 密集视点计时
 
 | 机器 | 标签 | 跑什么 | 结果上传到 |
 |---|---|---|---|

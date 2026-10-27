@@ -185,6 +185,10 @@ def main():
             print(f"[{setup}] 跳过第一轮的旧 GS 目录（无渲染变体信息）: {stale}")
             gs_vars = [gv for gv in gs_vars if gv not in stale]
             gs_meta = {gv: gs_meta[gv] for gv in gs_vars}
+        if ecfg.get("only_gs"):  # round 17: evaluate only the variants of the chosen direction (others stay on disk)
+            keep = [re.compile(p) for p in ecfg["only_gs"]]
+            gs_vars = [gv for gv in gs_vars if any(p.search(gv) for p in keep)]
+            gs_meta = {gv: gs_meta[gv] for gv in gs_vars}
         main_tok = f"gs_tok{ecfg.get('tto_main_variant', 'rife')}"  # one encode per variant since round 14
         tto_info.update({setup: m["tto"] for gv, m in gs_meta.items() if m.get("tto")
                          and (gv.startswith(f"{main_tok}{m.get('size')}_") or not gv.startswith("gs_tok"))})
@@ -254,6 +258,11 @@ def main():
             reg["rest"] = fg & ~reg["risk"] & ~reg["oracle_fail"]
             cube = cube_mask(gt, ck)
             reg["object"] = dilate(cube, ecfg["object_dilate_px"]) & dilate(b["fg_gt"], 3) & valid
+            vfile = gs_dir / str(ecfg.get("vis_from", "")) / f"cam{k}_vis.png"
+            if ecfg.get("vis_from") and vfile.exists():  # round 17: flow failures seen by both / by one input view
+                vis = read_alpha(vfile)
+                reg["fail_vis2"] = b["oracle"] & (vis > 0.75)
+                reg["fail_vis1"] = b["oracle"] & (vis > 0.25) & (vis <= 0.75)
 
             preds = {fv: load_rgb(flow_dir / fv / f"cam{k}.png") for fv in flow_vars}
             near_free = dilate(chroma_fg(preds[ref], ck), rcfg["fg_dilate_px"])  # GT-free subject neighbourhood
@@ -327,7 +336,9 @@ def main():
             for meth, p in preds.items():
                 smap = np.full(gt.shape[:2], np.nan, np.float32)
                 smap[y0:y1, x0:x1] = ssim_map(p[y0:y1, x0:x1], gt[y0:y1, x0:x1])
-                for rname in REGIONS:
+                for rname in ecfg.get("regions") or REGIONS:
+                    if rname not in reg:
+                        continue
                     region = reg[rname]
                     m = region & cover[meth]
                     if not m.any():

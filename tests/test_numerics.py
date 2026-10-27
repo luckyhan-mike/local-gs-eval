@@ -646,6 +646,35 @@ class NumericsTests(unittest.TestCase):
         flow = np.full_like(rgb2, 0.2)
         self.assertGreater(float(gate_by_flow(rgb2, flow, core2, 0.1, 1, 2)[12:18, 27:33].min()), 0.9)
 
+    def test_round17_fused_set_mutual_regions_fusion_and_optimisation(self):
+        from lgs import pixfuse
+        from lgs.pixgs import depth_sign
+        img_a, img_b, ga, gb, fg = self._two_views()
+        h, w = fg.shape
+        sign = depth_sign(ga[0], fg, np.isfinite(ga[0]))
+        rec_a = np.zeros((h, w), bool); rec_a[6:24, 26:46] = True           # a marks the square and its right side
+        rec_b = np.zeros((h, w), bool)                                        # b marks nothing
+        core_a = np.zeros((h, w), bool); core_a[10:20, 30:40] = True
+        G = pixfuse.build(img_a, img_b, ga, gb, rec_a, rec_b, core_a, np.zeros((h, w), bool), sign)
+        self.assertTrue(G["rec_b"][10:20, 20:30].all())                       # a's square is now also taken from b
+        self.assertGreater(int(G["n_b"]), 0)                                  # b pixels without a partner (hidden in a)
+        n_two_view = int(G["both"].sum())
+        self.assertEqual(int(G["n_a"]) + int(G["n_b"]), len(G["u"]))
+        G0 = pixfuse.build(img_a, img_b, ga, gb, rec_a, rec_b, core_a, np.zeros((h, w), bool), sign, mutual=False)
+        self.assertLessEqual(int(G0["rec_b"].sum()), 0)
+        self.assertGreater(n_two_view, 0)
+        S = pixfuse.make(G, 0.5, 3.0, "cpu")
+        rgb, alpha, core, vis = pixfuse.render_view(S, 0.5, (h, w), 0.3, "torch")
+        self.assertTrue(np.allclose(rgb[12:18, 27:33], 0.9, atol=0.05))       # square at x + t*g
+        self.assertGreater(float(core[12:18, 27:33].min()), 0.9)
+        self.assertGreater(float(vis[12:18, 28:32].min()), 0.75)              # seen by both views
+        # joint optimisation: start from wrong colours, the loss on the two real views must drop
+        S2 = pixfuse.make(G, 0.5, 3.0, "cpu")
+        S2.col += 1.0
+        log = pixfuse.optimise(S2, img_a, img_b, (h, w), 30, {"color": 0.1, "disp": 0.0, "opacity": 0.0, "scale": 0.0},
+                               0.3, "torch")
+        self.assertLess(log["log"][-1]["loss"], 0.5 * log["log"][0]["loss"])
+
 
 if __name__ == '__main__':
     unittest.main()

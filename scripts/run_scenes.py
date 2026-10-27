@@ -132,6 +132,8 @@ def summarize(root, shots, base):
         gated = set((pix.get("gate") or {}).get("runs", []))
         variants += [f"{tok}_{r['name']}{s}" for tok in pix.get("run_tokens", []) for r in pix.get("runs", [])
                      for s in ([""] + (["_g"] if r["name"] in gated else []))]  # round 16
+    if base["eval"].get("summary_variants"):  # round 17: only the variants of the chosen direction
+        variants = list(base["eval"]["summary_variants"])
     size = base["gs"]["sizes"][0]
     pats = {v: re.compile(rf"^(hyb_token|hyb_tokchk_oracle)\[gs_tok{re.escape(v)}{size}_.+_al(?:_tto(\d+))?_local\]$")
             for v in variants}
@@ -266,9 +268,59 @@ def summarize(root, shots, base):
         lines.append(f"| {shot} | {setup} | {v} | {t.get('window') or '—'} | {t.get('encode') or float('nan'):.2f} s | "
                      f"{(t.get('box') or float('nan')) * 100:.0f}% | {cps} | "
                      + ", ".join(f"{k} {x:.0f}s" for k, x in st.items()) + " |")
+    if base["eval"].get("summary_variants"):
+        lines = summary_r17(root, shots, base, variants, size) + lines
     root.mkdir(parents=True, exist_ok=True)
     (root / "summary_all.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
     print(f"done -> {root / 'summary_all.md'}")
+
+
+def summary_r17(root, shots, base, variants, size):
+    """Round 17 compact table: every target equally weighted, pooled over shots; direct and oracle paste; fg plus the
+    flow-failure region split by visibility (fail_vis2 = seen by both input views, fail_vis1 = by one)."""
+    ref = base["eval"]["ref_flow"]
+    regs = ["fg", "oracle_fail", "fail_vis2", "fail_vis1", "risk"]
+    data = defaultdict(dict)   # (shot, target) -> {(method, region): (psnr, lpips)}
+    for shot in shots:
+        f = root / shot.replace("/", "_") / "eval" / "metrics.csv"
+        if f.exists():
+            for r in csv.DictReader(f.open(encoding="utf-8")):
+                if r["region"] in regs:
+                    data[(shot, int(r["target"]))][(r["method"], r["region"])] = (float(r["psnr"]), float(r["lpips"]))
+    pat = {v: re.compile(rf"^gs_tok{re.escape(v)}{size}_.+_al(?:_tto100)?_local$") for v in variants}
+    gvs = sorted({m[m.index("[") + 1:-1] for d in data.values() for (m, _) in d if m.startswith("hyb_token[")})
+    gv_of = {v: next((g for g in gvs if pat[v].match(g)), None) for v in variants}
+    pilot = set(base["dataset6"].get("pilot_shots") or [])
+    out = ["# 第十七轮汇总（每个目标视点等权；直接 = 不用真值的贴回，oracle = 只贴真值失败区，诊断用）", "",
+           "不差 = 该目标 fg 的 PSNR 不低于且 LPIPS 不高于纯光流。失败区按可见性拆开：两侧可见 = 两个输入视角都看得到"
+           "（联合优化能约束），单侧可见 = 只有一个输入视角看得到（深度只能靠背景先验）。失败区几栏都是 oracle 贴回的结果。", ""]
+    for title, keep in (("全部场景", lambda s: True), ("第七轮试点场景（检测 CNN 未用其训练）", lambda s: s in pilot)):
+        ks = [k for k in sorted(data) if keep(k[0]) and (ref, "fg") in data[k]]
+        if not ks:
+            continue
+        out += [f"## {title}（{len(ks)} 个目标视点）", "",
+                "| 方法 | 直接 fg PSNR / LPIPS | 直接不差 | oracle fg PSNR / LPIPS | oracle 不差 | 失败区 | 失败区·两侧可见 | 失败区·单侧可见 |",
+                "|---|---:|---:|---:|---:|---:|---:|---:|"]
+
+        def cell(m, r):
+            v = [data[k][(m, r)] for k in ks if (m, r) in data[k]]
+            return f"{np.mean([x[0] for x in v]):.2f} / {np.mean([x[1] for x in v]):.4f}" if v else "—"
+
+        def nw(m):
+            n = sum(data[k][(m, "fg")][0] >= data[k][(ref, "fg")][0] - 1e-6
+                    and data[k][(m, "fg")][1] <= data[k][(ref, "fg")][1] + 1e-6 for k in ks if (m, "fg") in data[k])
+            return f"{n}/{len(ks)}"
+        out.append(f"| 纯光流 | {cell(ref, 'fg')} | — | — | — | {cell(ref, 'oracle_fail')} | {cell(ref, 'fail_vis2')} | "
+                   f"{cell(ref, 'fail_vis1')} |")
+        for v in variants:
+            g = gv_of[v]
+            if g is None:
+                continue
+            d, o = f"hyb_token[{g}]", f"hyb_tokchk_oracle[{g}]"
+            out.append(f"| {v}{' (TTO 100)' if g.endswith('_tto100_local') else ''} | {cell(d, 'fg')} | {nw(d)} | "
+                       f"{cell(o, 'fg')} | {nw(o)} | {cell(o, 'oracle_fail')} | {cell(o, 'fail_vis2')} | {cell(o, 'fail_vis1')} |")
+        out.append("")
+    return out
 
 
 if __name__ == "__main__":

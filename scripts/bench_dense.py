@@ -31,7 +31,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from lgs.common import imread_rgb, read_mask  # noqa: E402
 from lgs.pixgs import PixSet2, depth_sign, load_disp, prep_side_torch, render_view2  # noqa: E402
 from lgs.rife import RIFE  # noqa: E402
-from lgs import stereo_synth  # noqa: E402
+from lgs import pixfuse, stereo_synth  # noqa: E402
 
 REPO = Path(__file__).resolve().parents[1]
 
@@ -75,10 +75,11 @@ def main():
     ap.add_argument("--n", type=int, default=6)
     ap.add_argument("--views", nargs="+", type=int, default=[41, 60])
     ap.add_argument("--token", default="cnw_cnn")
-    ap.add_argument("--methods", nargs="+", default=["pix2", "p3h"])
+    ap.add_argument("--methods", nargs="+", default=["pix2", "pix3n", "pix3"])
     ap.add_argument("--disp", default="data/disp_fs/{shot}")
     ap.add_argument("--setup", default="in035")
     ap.add_argument("--warmup", type=int, default=3)
+    ap.add_argument("--opt-steps", type=int, default=100)
     args = ap.parse_args()
     base = yaml.safe_load(open(args.config, encoding="utf-8"))
     dcfg = base["dataset6"]
@@ -125,6 +126,28 @@ def main():
                     for _ in range(args.warmup):   # cuDNN / gsplat warm-up, not timed
                         rife_frame(rife, x0, x1, 0.5, h, w)
                     sync(); t0 = time.perf_counter()
+                    if method.startswith("pix3"):   # round 17: fused set (+ joint optimisation for pix3), once per pair
+                        G = pixfuse.build(img[a], img[b], d["ga"], d["gb"], rec[a], rec[b], core[a], core[b], sign,
+                                          float(pcfg.get("edge_px", 1.0)), True, dev)
+                        S3 = pixfuse.make(G, float(pcfg.get("sigma_px", 0.5)), float(pcfg.get("max_stretch_px", 3.0)), dev)
+                        sync(); ck.add("once_prep_build_s", time.perf_counter() - t0)
+                        steps = 0 if method == "pix3n" else int(args.opt_steps)
+                        ol = pixfuse.optimise(S3, img[a], img[b], (h, w), steps, pcfg.get("opt_lr"), float(pcfg.get("eps2d", 0.3)),
+                                              backend)
+                        ck.add("once_opt_s", ol["time_s"])
+                        ck.add("once_correspondence_export_s", float(dmeta.get(f"{a}-{b}", {}).get("time_stereo_s", float("nan"))))
+                        for i, t in enumerate([0.5] * args.warmup + ts):
+                            sync(); t0 = time.perf_counter()
+                            frame = rife_frame(rife, x0, x1, t, h, w)
+                            sync(); t1 = time.perf_counter()
+                            rgb, alpha, acore, _ = pixfuse.render_view(S3, t, (h, w), float(pcfg.get("eps2d", 0.3)), backend,
+                                                                       to_numpy=False)
+                            sync(); t2 = time.perf_counter()
+                            out = paste(frame, rgb, acore, alpha, feather)
+                            sync(); t3 = time.perf_counter()
+                            if i >= args.warmup:
+                                ck.add("view_rife_s", t1 - t0); ck.add("view_repair_s", t2 - t1); ck.add("view_paste_s", t3 - t2)
+                        continue
                     ga, oka = prep_side_torch(d["ga"], sign, dev)
                     gb, okb = prep_side_torch(d["gb"], -sign, dev)
                     ga, gb, oka, okb = (x.cpu().numpy() for x in (ga, gb, oka, okb))
@@ -152,11 +175,12 @@ def main():
                             ck.add("view_rife_s", t1 - t0); ck.add("view_repair_s", t2 - t1); ck.add("view_paste_s", t3 - t2)
                     del out
                 n_views = len(ts) * (len(ctx) - 1)
-                once = float(np.sum(ck.t["once_prep_build_s"]))
+                once = float(np.sum(ck.t["once_prep_build_s"])) + float(np.sum(ck.t.get("once_opt_s", [0.0])))
                 corr = float(np.nansum(ck.t["once_correspondence_export_s"]))
                 per = {k: float(np.mean(v)) for k, v in ck.t.items() if k.startswith("view_")}
                 tot = once + n_views * sum(per.values())
                 res[f"{method}_N{N}"] = {"views": n_views, "once_prep_build_s": once, "once_correspondence_s_windows3090": corr,
+                                         "once_opt_s": float(np.sum(ck.t.get("once_opt_s", [0.0]))),
                                          **{f"{k}_mean": v for k, v in per.items()},
                                          **{f"{k}_p90": float(np.quantile(ck.t[k], 0.9)) for k in per},
                                          "total_s_excl_correspondence": tot, "rife_only_s": n_views * per["view_rife_s"]}
@@ -171,13 +195,13 @@ def main():
     lines = [f"# 密集视点计时（{report['host']}，{report['gpu']}，pix2 渲染 {backend}，token {args.token}，对应 {args.disp}）", "",
              "每对输入相机生成 N 个视点（in035 共 2 对）。一次性 = 每对一次的位移整理和建高斯 / 建立合成数据（GPU）；"
              "对应关系（立体 / 光流）本身在 Windows RTX 3090 上导出，单列；token 标记见 rt_token_exp R1（3 台相机 28.7 ms / 帧），不在此计时。", "",
-             "| 方法 | N/对 | 视点数 | 一次性 (s) | RIFE (ms/视点) | 修补渲染 (ms/视点) | 贴回 (ms/视点) | 合计 (s) | 只用 RIFE (s) | 对应关系 (s, Windows) |",
-             "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|"]
+             "| 方法 | N/对 | 视点数 | 一次性 (s) | 其中联合优化 (s) | RIFE (ms/视点) | 修补渲染 (ms/视点) | 贴回 (ms/视点) | 合计 (s) | 只用 RIFE (s) | 对应关系 (s, Windows) |",
+             "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|"]
     for k in keys:
         rs = [r[k] for r in report["shots"].values() if k in r]
         m = lambda f: float(np.median([r[f] for r in rs]))
         method, n = k.split("_N")
-        lines.append(f"| {method} | {n} | {rs[0]['views']} | {m('once_prep_build_s'):.3f} | {m('view_rife_s_mean') * 1e3:.1f} | "
+        lines.append(f"| {method} | {n} | {rs[0]['views']} | {m('once_prep_build_s'):.3f} | {m('once_opt_s'):.3f} | {m('view_rife_s_mean') * 1e3:.1f} | "
                      f"{m('view_repair_s_mean') * 1e3:.1f} | {m('view_paste_s_mean') * 1e3:.1f} | {m('total_s_excl_correspondence'):.2f} | "
                      f"{m('rife_only_s'):.2f} | {m('once_correspondence_s_windows3090'):.2f} |")
     lines += ["", f"各列为 {len(report['shots'])} 组场景的中位数；逐场景数据见 {out.name}.json。"]
