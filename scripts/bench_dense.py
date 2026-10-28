@@ -1,18 +1,17 @@
 #!/usr/bin/env python3
-"""Round 16 stage C: wall-clock time of a dense set of virtual views with the token repair pasted in (one GPU, idle).
+"""Dense-view wall clock (round 18): N virtual views between every adjacent input pair, token repair pasted in, one idle
+GPU. Everything stays on the GPU; every timed block is bracketed by torch.cuda.synchronize().
 
-For each shot (its round-16 work dir must exist: aligned images, tokens/<setup>/<token>), each adjacent input pair (a, b)
-of the setup and N views per pair at t = k / (N + 1):
-  once per pair   correspondences loaded (in deployment: stereo / flow, time taken from the export meta.json),
-                  displacement prep on the GPU (lgs/pixgs.py prep_side_torch), primitives built once (PixSet2 /
-                  stereo_synth.prepare)
-  per view        RIFE at t (network only, tensors stay on the GPU), repair render (pix2: gsplat or the torch splat;
-                  p3h: stereo_synth.render), paste = feathered core blend into the RIFE frame on the GPU
-Every timed block is bracketed by torch.cuda.synchronize(). Nothing is written except the report:
-work_root/bench_dense_<host>.json and .md. Token detection is not run here (R1 F4M: 28.7 ms per frame for 3 cameras,
-measured in rt_token_exp); it is listed from that report in the .md.
+Per shot and pair (a, b) of the setup, views at t = k / (N + 1):
+  RIFE      seq32: one view at a time in fp32 (rounds 16/17); b16: views in batches of --batch with fp16 autocast
+  once      displacement prep + fused set build on the GPU (lgs/pixfuse.py, bg plane if --bgplane), then the joint
+            optimisation (--steps; 0 = pix3n), cropped to the recon box
+  per view  repair render (cropped to the Gaussians' box) and the feathered paste into the RIFE frame
+Not timed here: token detection (rt_token_exp R4 F4R-q: about 28 ms per frame for 3 cameras, RTX 3090) and the
+correspondences (FoundationStereo, exported on the Windows RTX 3090; their time is read from the export meta.json).
+Output: <work_root>/bench_dense_<host>.json / .md
 
-    python scripts/bench_dense.py --config configs/dataset6_lean.yaml --host linux-4090 --views 41 60
+    python scripts/bench_dense.py --config configs/dataset6_lean.yaml --host linux-4090 --views 30
 """
 import argparse
 import json
@@ -29,9 +28,9 @@ import yaml
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from lgs.common import imread_rgb, read_mask  # noqa: E402
-from lgs.pixgs import PixSet2, depth_sign, load_disp, prep_side_torch, render_view2  # noqa: E402
+from lgs.pixgs import depth_sign, load_disp  # noqa: E402
 from lgs.rife import RIFE  # noqa: E402
-from lgs import pixfuse, stereo_synth  # noqa: E402
+from lgs import pixfuse  # noqa: E402
 
 REPO = Path(__file__).resolve().parents[1]
 
@@ -41,25 +40,22 @@ def sync():
         torch.cuda.synchronize()
 
 
-class Clock:
-    def __init__(self):
-        self.t = {}
-
-    def add(self, name, dt):
-        self.t.setdefault(name, []).append(dt)
-
-
-def rife_frame(rife, x0, x1, t, h, w):
-    """IFNet at t on padded GPU tensors -> (3, h, w) frame, kept on the GPU (as lgs/rife.py synth, scale 1)."""
-    flow_list, mask_logit, _ = rife.net(torch.cat((x0, x1), 1), float(t), [16, 8, 4, 2, 1])
-    flow = flow_list[-1]
-    m = torch.sigmoid(mask_logit)
-    pred = rife.warp(x0, flow[:, :2]) * m + rife.warp(x1, flow[:, 2:4]) * (1 - m)
-    return pred[0, :, :h, :w].clamp(0, 1)
+def rife_batch(rife, x0, x1, ts, h, w, half):
+    """IFNet at several t in one batch (timestep tensor [B,1,1,1]) -> (B, 3, h, w) frames on the GPU."""
+    B = len(ts)
+    x = torch.cat((x0, x1), 1).expand(B, -1, -1, -1)
+    tt = torch.tensor(ts, device=x.device, dtype=x.dtype).view(B, 1, 1, 1)
+    with torch.autocast("cuda", dtype=torch.float16, enabled=half):
+        flow_list, mask_logit, _ = rife.net(x, tt, [16, 8, 4, 2, 1])
+    flow = flow_list[-1].float()
+    m = torch.sigmoid(mask_logit.float())
+    xb0, xb1 = x0.expand(B, -1, -1, -1), x1.expand(B, -1, -1, -1)
+    pred = rife.warp(xb0, flow[:, :2]) * m + rife.warp(xb1, flow[:, 2:4]) * (1 - m)
+    return pred[:, :, :h, :w].clamp(0, 1)
 
 
 def paste(frame, rgb, core, alpha, feather):
-    """Feathered core blend as evaluate.py (paste_weight), on the GPU."""
+    """Feathered core blend as evaluate.py (paste_weight), on the GPU. frame (3, H, W), rgb (H, W, 3)."""
     c = (core > 0.5) & (alpha > 0.5)
     k = feather // 2 * 2 + 1
     dil = F.max_pool2d(c.float()[None, None], k, 1, k // 2)
@@ -70,16 +66,17 @@ def paste(frame, rgb, core, alpha, feather):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--config", required=True)
-    ap.add_argument("--host", default=None, help="take the shots of dataset6.hosts[host] (first --n of them)")
+    ap.add_argument("--host", default=None, help="take the shots of dataset6.hosts[host]")
     ap.add_argument("--shots", nargs="*", default=None)
     ap.add_argument("--n", type=int, default=6)
-    ap.add_argument("--views", nargs="+", type=int, default=[41, 60])
-    ap.add_argument("--token", default="cnw_cnn")
-    ap.add_argument("--methods", nargs="+", default=["pix2", "pix3n", "pix3"])
+    ap.add_argument("--views", nargs="+", type=int, default=[30])
+    ap.add_argument("--token", default="f4rq")
+    ap.add_argument("--steps", nargs="+", type=int, default=[0, 50, 100], help="joint-optimisation steps (0 = pix3n)")
     ap.add_argument("--disp", default="data/disp_fs/{shot}")
+    ap.add_argument("--bgplane", default="data/bgplane/{room}", help="'' to switch the background plane off")
+    ap.add_argument("--batch", type=int, default=4)
     ap.add_argument("--setup", default="in035")
-    ap.add_argument("--warmup", type=int, default=3)
-    ap.add_argument("--opt-steps", type=int, default=100)
+    ap.add_argument("--warmup", type=int, default=2)
     args = ap.parse_args()
     base = yaml.safe_load(open(args.config, encoding="utf-8"))
     dcfg = base["dataset6"]
@@ -91,15 +88,18 @@ def main():
     data_root = Path(os.environ.get("LGS_DATA_ROOT", base["data_root"]))
     dev = "cuda" if torch.cuda.is_available() else "cpu"
     torch.set_grad_enabled(False)
+    torch.backends.cudnn.benchmark = True
     rife = RIFE(str(data_root / base["rife_dir"]) if not os.path.isabs(base["rife_dir"]) else base["rife_dir"], dev)
     try:
         import gsplat  # noqa: F401
         backend = "gsplat" if dev == "cuda" else "torch"
     except ImportError:
         backend = "torch"
+    eps2d = float(pcfg.get("eps2d", 0.3))
     feather = int(base["tokens"]["paste_feather_px"])
+    lr = pcfg.get("opt_lr")
     report = {"host": args.host or socket.gethostname(), "gpu": torch.cuda.get_device_name() if dev == "cuda" else "cpu",
-              "backend_pix2": backend, "token": args.token, "disp": args.disp, "setup": args.setup, "shots": {}}
+              "backend": backend, "token": args.token, "disp": args.disp, "bgplane": args.bgplane, "batch": args.batch, "shots": {}}
     for shot in shots:
         work = root / shot.replace("/", "_")
         droot = Path(args.disp.format(shot=shot.replace("/", "_")))
@@ -114,97 +114,85 @@ def main():
         res = {}
         for N in args.views:
             ts = [k / (N + 1) for k in range(1, N + 1)]
-            for method in args.methods:
-                ck = Clock()
-                for a, b in zip(ctx[:-1], ctx[1:]):
-                    pdir = work / "tokens" / args.setup / args.token / f"pair{a}-{b}"
-                    rec = {s: read_mask(pdir / f"cam{s}_recon.png") for s in (a, b)}
-                    core = {s: read_mask(pdir / f"cam{s}_core.png") for s in (a, b)}
-                    d = load_disp(droot / f"pair{a}-{b}.npz", (h, w))
-                    sign = depth_sign(d["ga"][0], fg[a], np.isfinite(d["ga"][0]))
-                    x0, x1 = pad(img[a]), pad(img[b])
-                    for _ in range(args.warmup):   # cuDNN / gsplat warm-up, not timed
-                        rife_frame(rife, x0, x1, 0.5, h, w)
+            T = {}
+            add = lambda k, v: T.setdefault(k, []).append(v)
+            for a, b in zip(ctx[:-1], ctx[1:]):
+                x0, x1 = pad(img[a]), pad(img[b])
+                for _ in range(args.warmup):
+                    rife_batch(rife, x0, x1, [0.5], h, w, False); rife_batch(rife, x0, x1, ts[:args.batch], h, w, True)
+                sync(); t0 = time.perf_counter()
+                for t in ts:
+                    rife_batch(rife, x0, x1, [t], h, w, False)
+                sync(); add("rife_seq32_s", time.perf_counter() - t0)
+                frames = []
+                sync(); t0 = time.perf_counter()
+                for i in range(0, N, args.batch):
+                    frames.append(rife_batch(rife, x0, x1, ts[i:i + args.batch], h, w, True))
+                frames = torch.cat(frames)
+                sync(); add("rife_b16_s", time.perf_counter() - t0)
+                add("corr_export_s", float(dmeta.get(f"{a}-{b}", {}).get("time_stereo_s", float("nan"))))
+                pdir = work / "tokens" / args.setup / args.token / f"pair{a}-{b}"
+                rec = {s: read_mask(pdir / f"cam{s}_recon.png") for s in (a, b)}
+                core = {s: read_mask(pdir / f"cam{s}_core.png") for s in (a, b)}
+                d = load_disp(droot / f"pair{a}-{b}.npz", (h, w))
+                sign = depth_sign(d["ga"][0], fg[a], np.isfinite(d["ga"][0]))
+                bg = None
+                if args.bgplane:
+                    z = np.load(REPO / args.bgplane.format(room=shot.split("/")[0]) / f"pair{a}-{b}.npz")
+                    bg = (torch.as_tensor(z["ga"].astype(np.float32), device=dev), torch.as_tensor(z["gb"].astype(np.float32), device=dev))
+                for steps in args.steps:
+                    tag = f"pix3_s{steps}" if steps else "pix3n"
                     sync(); t0 = time.perf_counter()
-                    if method.startswith("pix3"):   # round 17: fused set (+ joint optimisation for pix3), once per pair
-                        G = pixfuse.build(img[a], img[b], d["ga"], d["gb"], rec[a], rec[b], core[a], core[b], sign,
-                                          float(pcfg.get("edge_px", 1.0)), True, dev)
-                        S3 = pixfuse.make(G, float(pcfg.get("sigma_px", 0.5)), float(pcfg.get("max_stretch_px", 3.0)), dev)
-                        sync(); ck.add("once_prep_build_s", time.perf_counter() - t0)
-                        steps = 0 if method == "pix3n" else int(args.opt_steps)
-                        ol = pixfuse.optimise(S3, img[a], img[b], (h, w), steps, pcfg.get("opt_lr"), float(pcfg.get("eps2d", 0.3)),
-                                              backend)
-                        ck.add("once_opt_s", ol["time_s"])
-                        ck.add("once_correspondence_export_s", float(dmeta.get(f"{a}-{b}", {}).get("time_stereo_s", float("nan"))))
-                        for i, t in enumerate([0.5] * args.warmup + ts):
-                            sync(); t0 = time.perf_counter()
-                            frame = rife_frame(rife, x0, x1, t, h, w)
-                            sync(); t1 = time.perf_counter()
-                            rgb, alpha, acore, _ = pixfuse.render_view(S3, t, (h, w), float(pcfg.get("eps2d", 0.3)), backend,
-                                                                       to_numpy=False)
-                            sync(); t2 = time.perf_counter()
-                            out = paste(frame, rgb, acore, alpha, feather)
-                            sync(); t3 = time.perf_counter()
-                            if i >= args.warmup:
-                                ck.add("view_rife_s", t1 - t0); ck.add("view_repair_s", t2 - t1); ck.add("view_paste_s", t3 - t2)
-                        continue
-                    ga, oka = prep_side_torch(d["ga"], sign, dev)
-                    gb, okb = prep_side_torch(d["gb"], -sign, dev)
-                    ga, gb, oka, okb = (x.cpu().numpy() for x in (ga, gb, oka, okb))
-                    if method == "pix2":
-                        sig, mx, e = float(pcfg.get("sigma_px", 0.5)), float(pcfg.get("max_stretch_px", 3.0)), float(pcfg.get("edge_px", 1.0))
-                        S = [PixSet2(img[a], ga, oka, core[a], rec[a], sign, sig, mx, e, dev),
-                             PixSet2(img[b], gb, okb, core[b], rec[b], -sign, sig, mx, e, dev)]
-                    else:
-                        P = stereo_synth.prepare(img[a], img[b], ga, gb, oka, okb, core[a], core[b], rec[a], rec[b], sign, dev)
-                    sync(); ck.add("once_prep_build_s", time.perf_counter() - t0)
-                    ck.add("once_correspondence_export_s", float(dmeta.get(f"{a}-{b}", {}).get("time_stereo_s", float("nan"))))
+                    G = pixfuse.build(img[a], img[b], d["ga"], d["gb"], rec[a], rec[b], core[a], core[b], sign,
+                                      float(pcfg.get("edge_px", 1.0)), True, dev, bg=bg)
+                    S = pixfuse.make(G, float(pcfg.get("sigma_px", 0.5)), float(pcfg.get("max_stretch_px", 3.0)), dev)
+                    sync(); add(f"{tag}|build_s", time.perf_counter() - t0)
+                    ol, _ = pixfuse.optimise(S, img[a], img[b], (h, w), steps, lr, eps2d, backend)
+                    add(f"{tag}|opt_s", ol["time_s"])
                     for i, t in enumerate([0.5] * args.warmup + ts):
-                        sync(); t0 = time.perf_counter()
-                        frame = rife_frame(rife, x0, x1, t, h, w)
                         sync(); t1 = time.perf_counter()
-                        if method == "pix2":
-                            rgb, alpha, acore, _ = render_view2([S[0].at(t), S[1].at(1 - t)], t, (h, w), pcfg, dev, backend,
-                                                                to_numpy=False)
-                        else:
-                            rgb, alpha, acore = stereo_synth.render(P, t, to_numpy=False)
+                        rgb, alpha, acore, _ = pixfuse.render_view(S, t, (h, w), eps2d, backend, to_numpy=False)
                         sync(); t2 = time.perf_counter()
-                        out = paste(frame, rgb, acore, alpha, feather)
+                        out = paste(frames[max(i - args.warmup, 0)], rgb, acore, alpha, feather)
                         sync(); t3 = time.perf_counter()
                         if i >= args.warmup:
-                            ck.add("view_rife_s", t1 - t0); ck.add("view_repair_s", t2 - t1); ck.add("view_paste_s", t3 - t2)
-                    del out
-                n_views = len(ts) * (len(ctx) - 1)
-                once = float(np.sum(ck.t["once_prep_build_s"])) + float(np.sum(ck.t.get("once_opt_s", [0.0])))
-                corr = float(np.nansum(ck.t["once_correspondence_export_s"]))
-                per = {k: float(np.mean(v)) for k, v in ck.t.items() if k.startswith("view_")}
-                tot = once + n_views * sum(per.values())
-                res[f"{method}_N{N}"] = {"views": n_views, "once_prep_build_s": once, "once_correspondence_s_windows3090": corr,
-                                         "once_opt_s": float(np.sum(ck.t.get("once_opt_s", [0.0]))),
-                                         **{f"{k}_mean": v for k, v in per.items()},
-                                         **{f"{k}_p90": float(np.quantile(ck.t[k], 0.9)) for k in per},
-                                         "total_s_excl_correspondence": tot, "rife_only_s": n_views * per["view_rife_s"]}
-                print(f"[{shot}] {method} N={N}/pair ({n_views} views): once {once:.3f} s + per view "
-                      f"rife {per['view_rife_s'] * 1e3:.1f} / repair {per['view_repair_s'] * 1e3:.1f} / paste {per['view_paste_s'] * 1e3:.1f} ms"
-                      f" -> {tot:.2f} s (RIFE alone {res[f'{method}_N{N}']['rife_only_s']:.2f} s; correspondences {corr:.2f} s on Windows)",
-                      flush=True)
+                            add(f"{tag}|render_s", t2 - t1); add(f"{tag}|paste_s", t3 - t2)
+                    del out, S, G
+                del frames
+            nv = N * (len(ctx) - 1)
+            r = {"views": nv, "rife_seq32_s": float(np.sum(T["rife_seq32_s"])), "rife_b16_s": float(np.sum(T["rife_b16_s"])),
+                 "corr_export_s": float(np.nansum(T["corr_export_s"]))}
+            for steps in args.steps:
+                tag = f"pix3_s{steps}" if steps else "pix3n"
+                r[tag] = {"build_s": float(np.sum(T[f"{tag}|build_s"])), "opt_s": float(np.sum(T[f"{tag}|opt_s"])),
+                          "render_ms": float(np.mean(T[f"{tag}|render_s"]) * 1e3), "paste_ms": float(np.mean(T[f"{tag}|paste_s"]) * 1e3)}
+                q = r[tag]
+                q["total_s"] = r["rife_b16_s"] + q["build_s"] + q["opt_s"] + nv * (q["render_ms"] + q["paste_ms"]) / 1e3
+            res[f"N{N}"] = r
+            print(f"[{shot}] N={N}/pair ({nv} views): RIFE seq fp32 {r['rife_seq32_s']:.2f} s -> batch fp16 {r['rife_b16_s']:.2f} s; "
+                  + "; ".join(f"{k}: build {v['build_s']:.2f} + opt {v['opt_s']:.2f} s, {v['render_ms']:.1f}+{v['paste_ms']:.1f} ms/view, "
+                              f"total {v['total_s']:.2f} s" for k, v in r.items() if isinstance(v, dict)), flush=True)
         report["shots"][shot] = res
     out = root / f"bench_dense_{report['host']}"
     out.with_suffix(".json").write_text(json.dumps(report, indent=1), encoding="utf-8")
-    keys = sorted({k for r in report["shots"].values() for k in r})
-    lines = [f"# 密集视点计时（{report['host']}，{report['gpu']}，pix2 渲染 {backend}，token {args.token}，对应 {args.disp}）", "",
-             "每对输入相机生成 N 个视点（in035 共 2 对）。一次性 = 每对一次的位移整理和建高斯 / 建立合成数据（GPU）；"
-             "对应关系（立体 / 光流）本身在 Windows RTX 3090 上导出，单列；token 标记见 rt_token_exp R1（3 台相机 28.7 ms / 帧），不在此计时。", "",
-             "| 方法 | N/对 | 视点数 | 一次性 (s) | 其中联合优化 (s) | RIFE (ms/视点) | 修补渲染 (ms/视点) | 贴回 (ms/视点) | 合计 (s) | 只用 RIFE (s) | 对应关系 (s, Windows) |",
-             "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|"]
-    for k in keys:
-        rs = [r[k] for r in report["shots"].values() if k in r]
-        m = lambda f: float(np.median([r[f] for r in rs]))
-        method, n = k.split("_N")
-        lines.append(f"| {method} | {n} | {rs[0]['views']} | {m('once_prep_build_s'):.3f} | {m('once_opt_s'):.3f} | {m('view_rife_s_mean') * 1e3:.1f} | "
-                     f"{m('view_repair_s_mean') * 1e3:.1f} | {m('view_paste_s_mean') * 1e3:.1f} | {m('total_s_excl_correspondence'):.2f} | "
-                     f"{m('rife_only_s'):.2f} | {m('once_correspondence_s_windows3090'):.2f} |")
-    lines += ["", f"各列为 {len(report['shots'])} 组场景的中位数；逐场景数据见 {out.name}.json。"]
+    med = lambda f: float(np.median([f(r) for r in report["shots"].values()]))
+    lines = [f"# 密集视点计时（{report['host']}，{report['gpu']}，渲染 {backend}，token {args.token}，对应 {args.disp}，"
+             f"背景平面 {args.bgplane or '关'}）", "",
+             f"每对相邻输入相机之间 N 个虚拟视点（in035 共 2 对）；{len(report['shots'])} 组场景的中位数。全部在 GPU 上；"
+             "token（R4 F4R-q，3 台相机约 28 ms / 帧）和对应关系（FoundationStereo，Windows RTX 3090 导出，单列）不在本表计时内。", ""]
+    for N in args.views:
+        k = f"N{N}"
+        lines += [f"## N = {N} / 对（共 {med(lambda r: r[k]['views']):.0f} 个虚拟视点）", "",
+                  f"RIFE：逐个视点 fp32 {med(lambda r: r[k]['rife_seq32_s']):.2f} s → 批量（{args.batch}）fp16 "
+                  f"**{med(lambda r: r[k]['rife_b16_s']):.2f} s**；对应关系（立体，Windows 导出）{med(lambda r: r[k]['corr_export_s']):.2f} s", "",
+                  "| 方法 | 建立 (s) | 联合优化 (s) | 渲染 (ms/视点) | 贴回 (ms/视点) | 合计含批量 RIFE (s) |", "|---|---:|---:|---:|---:|---:|"]
+        for steps in args.steps:
+            tag = f"pix3_s{steps}" if steps else "pix3n"
+            lines.append(f"| {tag} | {med(lambda r: r[k][tag]['build_s']):.3f} | {med(lambda r: r[k][tag]['opt_s']):.3f} | "
+                         f"{med(lambda r: r[k][tag]['render_ms']):.2f} | {med(lambda r: r[k][tag]['paste_ms']):.2f} | "
+                         f"{med(lambda r: r[k][tag]['total_s']):.2f} |")
+        lines.append("")
+    lines.append(f"逐场景数据见 {out.name}.json。")
     out.with_suffix(".md").write_text("\n".join(lines) + "\n", encoding="utf-8")
     print("\n".join(lines))
 

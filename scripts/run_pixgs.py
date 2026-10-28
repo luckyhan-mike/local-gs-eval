@@ -130,7 +130,7 @@ def round16(cfg, work, setup, ctx, targets, t_of, img, fg, pcfg, size, device, r
     for run in pcfg.get("runs", []):
         droot = disp_root(run["disp"], cfg, repo)
         disp = {(a, b): load_disp(droot / f"pair{a}-{b}.npz", shape) for a, b in zip(ctx[:-1], ctx[1:])}
-        for tok in pcfg.get("run_tokens", []):
+        for tok in run.get("tokens", pcfg.get("run_tokens", [])):   # round 18: a run may name its own tokens
             tdir = work / "tokens" / setup / tok
             if not tdir.is_dir():
                 print(f"[{setup}] 没有 token 变体 {tok}，跳过")
@@ -149,42 +149,64 @@ def round16(cfg, work, setup, ctx, targets, t_of, img, fg, pcfg, size, device, r
                 rec = {s: read_mask(pdir / f"cam{s}_recon.png") for s in (a, b)}
                 core = {s: read_mask(pdir / f"cam{s}_core.png") for s in (a, b)}
                 sign = depth_sign(d["ga"][0], fg[a], np.isfinite(d["ga"][0]))
-                if method == "pix3":   # round 17: fused set, built and optimised once per pair, reused for all its views
+                if method == "pix3":   # fused set, built and optimised once per pair (GPU), reused for all its views
                     backend = gs_backend(device)
+                    cks = [int(c) for c in run.get("checkpoints", [])]
+                    for c in cks:      # round 18: snapshots of the same optimisation at fewer steps
+                        outs.setdefault(f"{label}_s{c}", work / "gs" / setup / f"gs_tok{label}_s{c}{size}_{method}_al_local")
                     if (a, b) not in fused:
+                        bg = None
+                        if run.get("bgplane"):   # round 18: boot background plane of the room for single-view pixels
+                            z = np.load(disp_root(run["bgplane"].replace("{room}", cfg["shot"].split("/")[0]), cfg, repo)
+                                        / f"pair{a}-{b}.npz")
+                            bg = (z["ga"].astype(np.float32), z["gb"].astype(np.float32))
                         sync(device); t0 = time.time()
                         G = pixfuse.build(img[a], img[b], d["ga"], d["gb"], rec[a], rec[b], core[a], core[b], sign,
-                                          float(pcfg.get("edge_px", 1.0)), bool(run.get("mutual", True)), device)
+                                          float(pcfg.get("edge_px", 1.0)), bool(run.get("mutual", True)), device,
+                                          bg=bg, conf=run.get("conf"))
                         S = pixfuse.make(G, float(pcfg.get("sigma_px", 0.5)), float(pcfg.get("max_stretch_px", 3.0)), device)
                         sync(device); t_build = time.time() - t0
                         lr = dict(pcfg.get("opt_lr") or {}, **(run.get("opt_lr") or {}))   # a run may override single rates
-                        ol = pixfuse.optimise(S, img[a], img[b], shape, int(run.get("opt_steps", 0)), lr,
-                                              float(pcfg.get("eps2d", 0.3)), backend)
-                        fused[(a, b)] = S
+                        ol, snaps = pixfuse.optimise(S, img[a], img[b], shape, int(run.get("opt_steps", 0)), lr,
+                                                     float(pcfg.get("eps2d", 0.3)), backend, checkpoints=cks)
+                        fused[(a, b)] = (S, {"": S.snapshot(), **{f"_s{c}": snaps[c] for c in cks if c in snaps}})
                         pair_log[f"{a}-{b}"] = {"build_s": t_build, "opt": ol, "n_both_view": int(G["both"].sum()),
                                                 "n_a": int(G["n_a"]), "n_b_only": int(G["n_b"]),
                                                 "rec_a_px": int(G["rec_a"].sum()), "rec_b_px": int(G["rec_b"].sum()),
-                                                "rec_a_px_own": int(rec[a].sum()), "rec_b_px_own": int(rec[b].sum())}
+                                                "rec_a_px_own": int(rec[a].sum()), "rec_b_px_own": int(rec[b].sum()),
+                                                **G["stats"]}
                         t_prep.append(t_build + ol["time_s"])
-                    S = fused[(a, b)]
-                    sync(device); t0 = time.time()
-                    rgb, alpha, acore, vis = pixfuse.render_view(S, t, shape, float(pcfg.get("eps2d", 0.3)), backend)
-                    sync(device); t_render.append(time.time() - t0)
-                    n = len(S.u)
-                    n_total += n
-                    stats[str(k)] = {"pair": f"{a}-{b}", "t": t, "gaussians": n, "depth_sign": sign,
-                                     "core_px": int((acore > 0.5).sum()),
-                                     "vis_both_share_in_core": float((vis[acore > 0.5] > 0.75).mean()) if (acore > 0.5).any() else 0.0}
-                    write_view(outs[label], k, rgb, alpha, acore, shape)
-                    imwrite(outs[label] / f"cam{k}_vis.png", np.repeat(vis[..., None], 3, -1))
-                    if f"{label}_g" in outs:
-                        if k not in flow:
-                            flow[k] = imread_rgb(work / "flow" / setup / ref / f"cam{k}.png").astype(np.float32) / 255.0
-                        ag = gate_by_flow(rgb, flow[k], acore, float(gcfg.get("thr", 0.05)), float(gcfg.get("blur_px", 3)),
-                                          int(gcfg.get("dilate_px", 8)))
-                        stats[str(k)]["gate_keep"] = float((ag > 0.5).sum() / max((acore > 0.5).sum(), 1))
-                        write_view(outs[f"{label}_g"], k, rgb, alpha, ag, shape)
-                        imwrite(outs[f"{label}_g"] / f"cam{k}_vis.png", np.repeat(vis[..., None], 3, -1))
+                    S, snaps = fused[(a, b)]
+                    for suf, snap in snaps.items():
+                        S.load(snap)
+                        sync(device); t0 = time.time()
+                        rgb_t, a_t, core_t, vis_t = pixfuse.render_view(S, t, shape, float(pcfg.get("eps2d", 0.3)), backend,
+                                                                        to_numpy=False)
+                        sync(device)
+                        if suf == "":
+                            t_render.append(time.time() - t0)
+                        rgb, alpha, acore, vis = (x.cpu().numpy() for x in (rgb_t, a_t, core_t, vis_t))
+                        lab = label + suf
+                        n = len(S.u)
+                        if suf == "":
+                            n_total += n
+                            stats[str(k)] = {"pair": f"{a}-{b}", "t": t, "gaussians": n, "depth_sign": sign,
+                                             "core_px": int((acore > 0.5).sum()),
+                                             "vis_both_share_in_core": float((vis[acore > 0.5] > 0.75).mean())
+                                             if (acore > 0.5).any() else 0.0}
+                        write_view(outs[lab], k, rgb, alpha, acore, shape)
+                        imwrite(outs[lab] / f"cam{k}_vis.png", np.repeat(vis[..., None], 3, -1))
+                        if suf == "" and f"{label}_g" in outs:
+                            if k not in flow:
+                                flow[k] = imread_rgb(work / "flow" / setup / ref / f"cam{k}.png").astype(np.float32) / 255.0
+                            import torch
+                            ag = pixfuse.gate_t(rgb_t, torch.as_tensor(flow[k], device=rgb_t.device), core_t,
+                                                float(gcfg.get("thr", 0.05)), float(gcfg.get("blur_px", 3)),
+                                                int(gcfg.get("dilate_px", 8))).cpu().numpy()
+                            stats[str(k)]["gate_keep"] = float((ag > 0.5).sum() / max((acore > 0.5).sum(), 1))
+                            write_view(outs[f"{label}_g"], k, rgb, alpha, ag, shape)
+                            imwrite(outs[f"{label}_g"] / f"cam{k}_vis.png", np.repeat(vis[..., None], 3, -1))
+                    S.load(snaps[""])
                     continue
                 t0 = time.time()
                 ga, oka = prep_side(d["ga"], sign)     # once per pair in deployment (not per view)

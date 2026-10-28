@@ -1,0 +1,5 @@
+{
+ "room": "changjing1",
+ "boot_frame": "changjing1/shot_0021",
+ "method": "rt_token_exp R3 boot_plane: DIS on the boot frame, affine fit of the far 60 %"
+}

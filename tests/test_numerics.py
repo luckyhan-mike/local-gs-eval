@@ -647,6 +647,7 @@ class NumericsTests(unittest.TestCase):
         self.assertGreater(float(gate_by_flow(rgb2, flow, core2, 0.1, 1, 2)[12:18, 27:33].min()), 0.9)
 
     def test_round17_fused_set_mutual_regions_fusion_and_optimisation(self):
+        import torch
         from lgs import pixfuse
         from lgs.pixgs import depth_sign
         img_a, img_b, ga, gb, fg = self._two_views()
@@ -671,9 +672,39 @@ class NumericsTests(unittest.TestCase):
         # joint optimisation: start from wrong colours, the loss on the two real views must drop
         S2 = pixfuse.make(G, 0.5, 3.0, "cpu")
         S2.col += 1.0
-        log = pixfuse.optimise(S2, img_a, img_b, (h, w), 30, {"color": 0.1, "disp": 0.0, "opacity": 0.0, "scale": 0.0},
-                               0.3, "torch")
+        log, snaps = pixfuse.optimise(S2, img_a, img_b, (h, w), 30, {"color": 0.1, "disp": 0.0, "opacity": 0.0, "scale": 0.0},
+                                      0.3, "torch", checkpoints=[10])
         self.assertLess(log["log"][-1]["loss"], 0.5 * log["log"][0]["loss"])
+        self.assertEqual(sorted(snaps), [10])                                 # snapshot at 10 of 30 steps
+        final = S2.snapshot()
+        S2.load(snaps[10]); self.assertFalse(torch.equal(S2.col, final[0]))   # the snapshot is an earlier state
+        S2.load(final); self.assertTrue(torch.equal(S2.col, final[0]))
+
+    def test_round18_background_plane_only_where_fill_is_near_the_wall_and_gpu_gate(self):
+        import torch
+        from lgs import pixfuse
+        from lgs.pixgs import depth_sign, gate_by_flow
+        img_a, img_b, ga, gb, fg = self._two_views()
+        h, w = fg.shape
+        sign = depth_sign(ga[0], fg, np.isfinite(ga[0]))
+        rec = np.ones((h, w), bool)
+        z = np.zeros((h, w), bool)
+        pa = np.zeros((2, h, w), np.float32); pa[0] = 4.5                      # boot plane: the wall, 0.5 px off
+        pb = -pa
+        G0 = pixfuse.build(img_a, img_b, ga, gb, rec, rec, z, z, sign, mutual=False)
+        G1 = pixfuse.build(img_a, img_b, ga, gb, rec, rec, z, z, sign, mutual=False, bg=(pa, pb))
+        # b's pixels hidden in a (x 30..33) were row-filled with the wall (-4): within 6 px of the plane -> plane
+        self.assertGreater(G1["stats"]["bg_px"], 0)
+        self.assertEqual(len(G0["u"]), len(G1["u"]))
+        G2 = pixfuse.build(img_a, img_b, ga, gb, rec, rec, z, z, sign, mutual=False, bg=(pa + 40, pb - 40))
+        self.assertEqual(G2["stats"]["bg_px"], 0)                              # plane far from the fill: fill kept
+        rgb = np.random.RandomState(0).rand(h, w, 3).astype(np.float32)
+        flow = rgb.copy(); flow[10:20, 30:40] += 0.5
+        core = np.ones((h, w), np.float32)
+        ref = gate_by_flow(rgb, flow, core, 0.1, 1, 2) > 0.5
+        gt = pixfuse.gate_t(torch.as_tensor(rgb), torch.as_tensor(flow), torch.as_tensor(core), 0.1, 1, 2).numpy() > 0.5
+        self.assertTrue(gt[12:18, 32:38].all() and not gt[30:, 60:].any())
+        self.assertGreater((ref == gt).mean(), 0.97)                           # square vs ellipse dilation only
 
 
 if __name__ == '__main__':

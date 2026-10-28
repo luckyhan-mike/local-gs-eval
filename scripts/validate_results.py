@@ -62,10 +62,10 @@ def main():
                                  if v in tok_vars]
                     gated = set((pix.get("gate") or {}).get("runs", []))
                     for r in pix.get("runs", []):  # round 16: <token>_<run>[_g]
-                        for tok in pix.get("run_tokens", []):
+                        for tok in r.get("tokens", pix.get("run_tokens", [])):   # round 18: per-run tokens, _s<n> snapshots
                             if tok in tok_vars:
-                                variants += [f"gs_tok{tok}_{r['name']}{s}{gcfg['sizes'][0]}_{r['method']}_al_local"
-                                             for s in ([""] + (["_g"] if r["name"] in gated else []))]
+                                sufs = [""] + (["_g"] if r["name"] in gated else []) + [f"_s{c}" for c in r.get("checkpoints", [])]
+                                variants += [f"gs_tok{tok}_{r['name']}{s}{gcfg['sizes'][0]}_{r['method']}_al_local" for s in sufs]
             else:
                 full = [f"gs_{lab}{t}" for lab in (labels if crop == "token" else [crop]) for t in tails]
                 variants += full + ([v + "_local" for v in full] if tok_root.exists() else [])

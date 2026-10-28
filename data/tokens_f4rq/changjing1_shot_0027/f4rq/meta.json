@@ -1,0 +1,15 @@
+{
+ "shot": "changjing1/shot_0027",
+ "cams": [
+  0,
+  3,
+  5
+ ],
+ "scheme": "rt_token_exp R4 F4R-q (held-out fold net, CV-chosen theta/tau)",
+ "0-3/cam0_area_aligned": 0.05758751183748245,
+ "0-3/cam3_area_aligned": 0.054534316062927246,
+ "0-3/time_s_incl_probe_views": 1.926138999988325,
+ "3-5/cam3_area_aligned": 0.03979779779911041,
+ "3-5/cam5_area_aligned": 0.03844975680112839,
+ "3-5/time_s_incl_probe_views": 1.7208055999944918
+}

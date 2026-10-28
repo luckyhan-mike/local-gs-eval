@@ -14,7 +14,60 @@
 
 ---
 
-## 第十七轮（当前）：两侧重建区互投补齐 + 融合 + 联合优化（pix3），只跑选定方向
+## 第十八轮（当前）：接入新 token（F4R-q，不跑 VGGT）+ 开机背景平面 + GPU 提速，只跑 12 组场景
+
+| 机器 | 标签 | 跑什么（各 6 组，都在本机第十七轮的工作目录里） | 结果上传到 |
+|---|---|---|---|
+| linux-4090 | `linux-4090-round18-f4rq` | changjing 0000 / 0003，changjing1 0001 / 0007 / 0013 / 0022 | `experiment/linux-4090-round18-f4rq-<日期>` |
+| linux-3090 | `linux-3090-round18-f4rq` | changjing 0008，changjing1 0012 / 0018 / 0021 / 0027 / 0032 | `experiment/linux-3090-round18-f4rq-<日期>` |
+
+**为什么只跑 12 组**：先快速看效果。这 12 组就是 rt_token_exp R4 在 in035 上用的场景：6 组试点（检测 CNN 没用它们训练）+ 6 组非试点，包含光流失败最严重的几组（changjing1 0001 / 0022 / 0032 / 0007）。完整 23/23 分组保留在配置的 `dataset6.hosts_full`。
+
+**本轮比较**（对应关系固定 FS-L，方法固定 pix3 = 两侧互投补齐 + 融合 + 联合优化 100 步）：
+
+| 汇总里的名字 | 做法 |
+|---|---|
+| `cnw_cnn_pix3_fsl` | 第十七轮结果（第七轮 Cn_wide token，要跑 VGGT），不重算，作对照 |
+| `f4rq_pix3_fsl` | **换 token**：rt_token_exp R4 推荐的 F4R-q（RIFE 光流几何 + 复用生成视点探测 + 1/4 分辨率重训 CNN，3 台相机约 28 ms / 帧，不用 VGGT、不用标定）。每组场景用没在它上面训练过的那一折模型（5 折交叉验证），`tools/export_r18.py` 导出到 `data/tokens_f4rq/` |
+| `f4rq_pix3bg_fsl` | + **开机背景平面**（rt_token_exp R3）：只有一侧看得到的像素，如果原来沿行补的位移本来就落在墙附近（与背景平面差 < 6 px）或没有值，改用平滑的背景平面，去掉墙边的横向拉丝；被手挡住的身体、三脚架等非墙面像素不动。背景平面每个房间开机时算一次（`data/bgplane/`） |
+| `f4rq_pix3bg_fsl_g` | 同上 + 不用真值的贴回门控 |
+| `f4rq_pix3bg_fsl_s25` / `_s50` | 同一次联合优化在 25 / 50 步时的结果（看能否少优化几步） |
+| `cnw_cnn_mw (TTO 100)` | AnySplat 参照，不重算 |
+
+本机试过、没有纳入：两侧颜色对不上（光度误差）的像素不贴回——阈值 0.08 和 0.15 都让失败区变差，因为盒子反光这类两侧外观不同的地方恰好是光流失败、贴回最有用的地方。
+
+**GPU 提速**（都不需要安装任何东西）：
+- 融合高斯的建立整个在 GPU 上做（互投、闭运算、颜色采样、位移整理），不再在 CPU / GPU 之间来回拷贝；
+- 联合优化每一步只渲染重建区的包围框，而不是整帧；
+- 每个视点的渲染也只在高斯所在的包围框里做；门控改成 GPU 上的卷积和池化；
+- 密集视点计时：每对相邻相机之间 **30 个**虚拟视点（共 60 个）；RIFE 同时测"逐个视点 fp32"（原来的做法）和"每批 4 个视点、fp16"两种。
+
+**跑法**（工作目录用第十七轮那份；4090 若改过 `work_root`，同上次一样复制配置改 `work_root`）：
+
+```bash
+# 4090：HOST=linux-4090；3090：HOST=linux-3090
+cd $DATA_ROOT/local-gs-eval && git fetch --tags -f && git checkout ${HOST}-round18-f4rq
+ls data/tokens_f4rq | wc -l                                   # 应为 12
+python -m unittest discover -s tests -v                       # 26 项
+export HF_HUB_OFFLINE=1 PYTHONUNBUFFERED=1
+python scripts/run_scenes.py --config configs/dataset6_lean.yaml --host $HOST --steps tokens pixgs evaluate validate 2>&1 | tee work/dataset6_r18.log
+python scripts/bench_dense.py --config configs/dataset6_lean.yaml --host $HOST --views 30 2>&1 | tee work/bench_dense_r18.log
+```
+
+`tokens` 这一步要重跑（生成新 token 的 `tokens/in035/f4rq`），已有 token 会被原样重算。预计 4090 共约 15–20 分钟、3090 约 25–35 分钟（含计时）。计时时 GPU 上不能有别的任务。
+
+上传：`summary_all.md`、6 组的 `eval/`、`logs/`、`gs/*/gs_tokf4rq_*/meta.json`、`bench_dense_${HOST}.md/.json`、两个 `.log`、单元测试日志。
+
+**判断标准**：
+1. `f4rq_pix3_fsl` 对比 `cnw_cnn_pix3_fsl`：换成不跑 VGGT 的 token，直接贴回的画质有没有变差（试点组单独看）。
+2. `f4rq_pix3bg_fsl`：失败区·单侧可见是否变好，其余不变差。
+3. `_g`：直接贴回的 LPIPS 和不差目标数。
+4. `_s25` / `_s50` 对比 100 步：能否少优化。
+5. 计时：60 个视点时，批量 fp16 RIFE + 修补渲染 + 贴回的总时间；联合优化（包围框裁剪后）每对多少秒。
+
+**本机检查**（Windows RTX 3090，本机没有 gsplat、用简化渲染器，联合优化在这种渲染器下会偏差，只说明流程通了；本机 GPU 同时被其他任务占用，计时不可参考）：changjing1/shot_0021 上 token → pixgs → 评估跑通；F4R-q token 在 12 组上占原图 0.03–13%。
+
+## 第十七轮：两侧重建区互投补齐 + 融合 + 联合优化（pix3），只跑选定方向
 
 | 机器 | 标签 | 跑什么 | 结果上传到 |
 |---|---|---|---|

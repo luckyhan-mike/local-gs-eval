@@ -72,7 +72,23 @@ dataset6:
     - changjing1/shot_0032
     - changjing/shot_0000
     - changjing1/shot_0018
-  hosts:
+  hosts:                                           # 第十八轮：缩减为 12 组（rt_token_exp R4 的 in035 场景：6 组试点 + 6 组非试点，含最难的几组），
+                                                    # 每台 6 组，都在各自机器第十七轮的工作目录里；完整 23/23 分组见 hosts_full
+    linux-4090:
+      - changjing/shot_0000
+      - changjing/shot_0003
+      - changjing1/shot_0001
+      - changjing1/shot_0007
+      - changjing1/shot_0013
+      - changjing1/shot_0022
+    linux-3090:
+      - changjing/shot_0008
+      - changjing1/shot_0012
+      - changjing1/shot_0018
+      - changjing1/shot_0021
+      - changjing1/shot_0027
+      - changjing1/shot_0032
+  hosts_full:                                      # 第十四到十七轮：46 组按机器 23/23
     linux-4090:
       - changjing/shot_0000
       - changjing/shot_0001
@@ -159,6 +175,9 @@ tokens:                                 # 输入相机上的不可靠区域检�
     # 这里直接当作失败区：core = 掩码膨胀 core_dilate_px，recon = core 再外扩 recon_margin_px（不再限制在前景附近）
     cnw_cnn:  {external: "data/tokens_cnw/{shot}/cnn"}   # 检测器 = 第七轮重训的 CNN（τ=0.98），主方案
     cnw_f5:   {external: "data/tokens_cnw/{shot}/f5"}    # 检测器 = |W0−W1| 5×5 平滑（τ=0.16），不需训练
+    # 第十八轮：rt_token_exp R4 推荐的 F4R-q（不跑 VGGT：RIFE 光流几何 + 复用生成视点探测 + 1/4 分辨率重训 CNN，部署约 28 ms / 帧），
+    # 每组场景用没在它上面训练过的那一折模型（5 折交叉验证），tools/export_r18.py 导出（原图坐标）
+    f4rq:     {external: "data/tokens_f4rq/{shot}/f4rq"}
   # pair_gate：某相机对的 core 占前景比例（两台相机平均）低于该值时，该对之间的虚拟视点不触发 GS（=纯光流）。
   # 0.03 是初值（第六轮 cam5 oracle_fail 仅占前景 4.2%）；逐目标表会列出每对的 core 面积，便于事后定门限。
   ring_max_disp_px: 20                  # 环带配准位移超过该值视为不可信，退回直接贴回
@@ -204,16 +223,19 @@ gs:
     depth_tol_px: 3.0                   # 两侧高斯前后差小于 3 px 位移时按 (1-t) / t 混合，否则取更近的一侧
     skip_existing: true                 # 第十六轮：第十五轮的 *_pix 结果已在工作目录里时不重算
     # ---- 第十六轮：修补方法 × 对应来源（标签 <token>_<name>，目录 gs_tok<标签>448_<method>_al_local）----
-    run_tokens: [cnw_cnn]               # 第十六、十七轮只用 cnw_cnn（第十五轮主 token）
+    run_tokens: [f4rq]                  # 第十八轮：新 token；cnw_cnn 的 pix3 用第十七轮已有结果对照（不重算）
     edge_px: 1.0                        # pix2：|dg_x/dx| > 1 px/px（深度边缘）处不沿 x 拉长，裂缝留给另一侧或退回光流
     # 第十六轮 a 的 p3h（立体合成）、fss / flw 来源已比较完（pix2 + FS-L 胜出），第十七轮不再计算
+    # 第十七轮的 pix2 / pix3n 不再计算（pix3 胜出）；第十八轮在新 token 上逐项加改进
     runs:
-      - {name: pix2_fsl,  method: pix2, disp: "data/disp_fs/{shot}"}                             # 第十六轮基线：两侧各一份高斯、不优化
-      - {name: pix3n_fsl, method: pix3, disp: "data/disp_fs/{shot}", mutual: true, opt_steps: 0}   # 第十七轮：两侧重建区互投补齐 + 融合，不优化
-      - {name: pix3_fsl,  method: pix3, disp: "data/disp_fs/{shot}", mutual: true, opt_steps: 100} # 同上 + 两个真实视角联合优化 100 步（本机 torch 渲染器上 LPIPS 变差，用 gsplat 在 46 组上确认）
+      - {name: pix3_fsl,   method: pix3, disp: "data/disp_fs/{shot}", mutual: true, opt_steps: 100}   # ① 换 token：第十七轮 pix3，原样
+      - {name: pix3bg_fsl, method: pix3, disp: "data/disp_fs/{shot}", mutual: true, opt_steps: 100,
+         bgplane: "data/bgplane/{room}", checkpoints: [25, 50]}   # ② + 单侧可见像素若本来就落在墙附近（行填充与开机背景平面差 < 6 px）或无值，改用平滑的背景平面；
+                                                                  #   同一次优化另存 25 / 50 步（_s25 / _s50）
+    # 本机试过、未纳入：两侧颜色不一致（光度误差）的像素不贴回——阈值 0.08 / 0.15 都更差，因为盒子反光等外观差异处恰是光流失败、贴回最有用的地方
     opt_lr: {color: 0.02, disp: 0.05, opacity: 0.05, scale: 0.01}  # 联合优化学习率（颜色 logit、视差偏移 px、不透明度 logit、log 尺寸）
     gate:                               # 不用真值的贴回门控：只在渲染结果与光流结果明显不同处贴（<标签>_g）
-      runs: [pix2_fsl, pix3n_fsl]
+      runs: [pix3bg_fsl]                # ② 再加门控（_g）
       thr: 0.10                         # 平均 |RGB| 差（0–1），高斯模糊 3 px 后的阈值（0.05 在本机一组场景上只去掉 16–36% 的 core，太松）
       blur_px: 3
       dilate_px: 8
@@ -252,11 +274,13 @@ risk:                                   # 光流自身信号 → 风险区域（
 eval:
   lean: true                            # 精简：只评参考光流，不做风险阈值扫描、环带配准
   only_gs:                              # 第十七轮：只评估当前方向的变体（目录名正则），其余 GS 结果留在磁盘上不评估
-    - "^gs_tokcnw_cnn_(pix2_fsl|pix3n_fsl|pix3_fsl)(_g)?448_"
+    - "^gs_tokcnw_cnn_pix3_fsl448_"                                # 第十七轮：cnw_cnn token 的 pix3（已在工作目录里）
+    - "^gs_tokf4rq_(pix3|pix3bg)_fsl(_g|_s25|_s50)?448_"
     - "^gs_tokcnw_cnn_mw448_nat_dil_al_tto100_local$"            # 参照：AnySplat 多窗口 + TTO 100 步（第十六轮失败区画质最好）
   regions: [fg, oracle_fail, risk, rest, fail_vis2, fail_vis1]  # 只算这些区域
-  vis_from: gs_tokcnw_cnn_pix3n_fsl448_pix3_al_local           # 取未优化的融合版（几何不受优化影响）； fail_vis2 / fail_vis1 = 光流失败区中两个输入视角都看得到 / 只有一个看得到的部分
-  summary_variants: [cnw_cnn_mw, cnw_cnn_pix2_fsl, cnw_cnn_pix2_fsl_g, cnw_cnn_pix3n_fsl, cnw_cnn_pix3n_fsl_g, cnw_cnn_pix3_fsl]
+  vis_from: gs_tokf4rq_pix3_fsl448_pix3_al_local               # 第十八轮取 f4rq 的 pix3； 取未优化的融合版（几何不受优化影响）； fail_vis2 / fail_vis1 = 光流失败区中两个输入视角都看得到 / 只有一个看得到的部分
+  summary_variants: [cnw_cnn_mw, cnw_cnn_pix3_fsl, f4rq_pix3_fsl, f4rq_pix3bg_fsl, f4rq_pix3bg_fsl_g, f4rq_pix3bg_fsl_s25,
+                     f4rq_pix3bg_fsl_s50]
   tto_main_variant: cnw_cnn             # 评估报告里 TTO 步数–耗时表用哪个变体
   ref_flow: flow_s1.0_pose              # 用于定义风险区域与混合的参考光流（第二轮起：pose t 在两种基线下都更好）
   fail_err_thresh: 0.08                 # 光流误差 > 该值视为“光流失败”（oracle 区域与 AUC 标签）
